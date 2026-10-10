@@ -11,6 +11,7 @@ https://blog.gnu.or.kr 의 소스입니다. [Astro](https://astro.build) 정적 
 title: "제목"
 description: "목록과 검색 결과에 보일 한두 문장 요약"
 date: 2026-10-11
+category: "DevOps·SRE"   # src/site.ts의 CATEGORIES 중 하나 (선택)
 tags: ["태그1", "태그2"]
 draft: false   # true면 로컬 미리보기에만 보이고 배포되지 않음
 ---
@@ -44,5 +45,6 @@ npm run build    # dist/ 에 결과물 생성
 
 ## 설정
 
-- 사이트 이름·소개: `src/site.ts`
+- 사이트 이름·소개, 카테고리 목록: `src/site.ts`
+- 소개 페이지: `src/pages/about.md` (마크다운으로 바로 고치면 됩니다)
 - 도메인: `astro.config.mjs`의 `site`, 그리고 GitHub Settings → Pages → Custom domain

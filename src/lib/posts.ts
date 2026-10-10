@@ -9,3 +9,12 @@ export async function getPosts() {
 export function tagSlug(tag: string) {
   return encodeURIComponent(tag.trim().toLowerCase().replace(/\s+/g, '-'));
 }
+
+/** Categories that have at least one published post, in CATEGORIES order, with counts. */
+export async function getCategories() {
+  const { CATEGORIES } = await import('../site');
+  const posts = await getPosts();
+  return CATEGORIES
+    .map((c) => ({ ...c, posts: posts.filter((p) => p.data.category === c.name) }))
+    .filter((c) => c.posts.length > 0);
+}

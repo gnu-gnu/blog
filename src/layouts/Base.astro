@@ -40,8 +40,9 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
       <a class="brand" href="/">{SITE.title}</a>
       <nav class="site-nav" aria-label="사이트">
         <a href="/">글</a>
+        <a href="/categories/">분류</a>
         <a href="/tags/">태그</a>
-        <a href="/rss.xml">RSS</a>
+        <a href="/about/">소개</a>
         <button class="theme-toggle" type="button" aria-label="밝은/어두운 테마 전환"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/></svg></button>
       </nav>
     </div>
@@ -51,7 +52,7 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
   </main>
   <footer class="site-foot">
     <div class="wrap">
-      © {new Date().getFullYear()} {SITE.author} · <a href={SITE.github}>GitHub</a>
+      © {new Date().getFullYear()} {SITE.author} · <a href={SITE.github}>GitHub</a> · <a href={SITE.linkedin}>LinkedIn</a> · <a href="/rss.xml">RSS</a>
     </div>
   </footer>
   <script is:inline>

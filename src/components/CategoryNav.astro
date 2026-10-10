@@ -1,0 +1,16 @@
+---
+import { getCategories, getPosts } from '../lib/posts';
+
+interface Props { current?: string }
+const { current } = Astro.props;
+const categories = await getCategories();
+const total = (await getPosts()).length;
+---
+{categories.length > 0 && (
+  <nav class="cat-nav" aria-label="카테고리">
+    <a href="/" aria-current={!current ? 'page' : undefined}>전체 <span>{total}</span></a>
+    {categories.map((c) => (
+      <a href={`/categories/${c.slug}/`} aria-current={current === c.slug ? 'page' : undefined}>{c.name} <span>{c.posts.length}</span></a>
+    ))}
+  </nav>
+)}

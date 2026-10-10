@@ -1,0 +1,21 @@
+---
+import Base from '../../layouts/Base.astro';
+import PostList from '../../components/PostList.astro';
+import CategoryNav from '../../components/CategoryNav.astro';
+import { getCategories } from '../../lib/posts';
+
+export async function getStaticPaths() {
+  const categories = await getCategories();
+  return categories.map((c) => ({ params: { slug: c.slug }, props: { category: c } }));
+}
+
+const { category } = Astro.props;
+---
+<Base title={category.name} description={category.description}>
+  <section class="intro">
+    <h1>{category.name}</h1>
+    <p>{category.description}</p>
+  </section>
+  <CategoryNav current={category.slug} />
+  <PostList posts={category.posts} />
+</Base>

@@ -1,6 +1,6 @@
 ---
 import type { CollectionEntry } from 'astro:content';
-import { formatDate } from '../site';
+import { formatDate, categoryOf } from '../site';
 import { tagSlug } from '../lib/posts';
 
 interface Props { posts: CollectionEntry<'posts'>[] }
@@ -12,6 +12,7 @@ const { posts } = Astro.props;
       <a class="title" href={`/posts/${post.id}/`}>{post.data.title}</a>
       <p>{post.data.description}</p>
       <div class="meta">
+        {categoryOf(post.data.category) && <a class="cat" href={`/categories/${categoryOf(post.data.category)!.slug}/`}>{post.data.category}</a>}
         <time datetime={post.data.date.toISOString()}>{formatDate(post.data.date)}</time>
         {post.data.tags.map((tag) => <a class="tag" href={`/tags/${tagSlug(tag)}/`}>{tag}</a>)}
         {post.data.draft && <span class="tag">초안</span>}

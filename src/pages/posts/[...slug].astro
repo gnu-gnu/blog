@@ -2,7 +2,7 @@
 import { render } from 'astro:content';
 import Base from '../../layouts/Base.astro';
 import { getPosts, tagSlug } from '../../lib/posts';
-import { SITE, formatDate } from '../../site';
+import { SITE, formatDate, categoryOf } from '../../site';
 
 export async function getStaticPaths() {
   const posts = await getPosts();
@@ -11,11 +11,13 @@ export async function getStaticPaths() {
 
 const { post } = Astro.props;
 const { Content, headings } = await render(post);
+const category = categoryOf(post.data.category);
 const toc = headings.filter((h) => h.depth === 2);
 ---
 <Base title={post.data.title} description={post.data.description} type="article">
   <article>
     <header class="article-head">
+      {category && <a class="cat" href={`/categories/${category.slug}/`}>{category.name}</a>}
       <h1>{post.data.title}</h1>
       <p class="lede">{post.data.description}</p>
       <div class="meta">
@@ -34,5 +36,9 @@ const toc = headings.filter((h) => h.depth === 2);
     <div class="prose">
       <Content />
     </div>
+    <aside class="author-box">
+      <p class="name"><a href="/about/">심근우</a> <span>Gnu Shim</span></p>
+      <p>LG유플러스 Ucube DAX팀 팀장. 통신 BSS와 DevOps/SRE 플랫폼을 맡고 있고, AI 인프라와 차세대 네트워크를 공부합니다.</p>
+    </aside>
   </article>
 </Base>

@@ -1,6 +1,7 @@
 ---
 import Base from '../layouts/Base.astro';
 import PostList from '../components/PostList.astro';
+import CategoryNav from '../components/CategoryNav.astro';
 import { getPosts } from '../lib/posts';
 import { SITE } from '../site';
 
@@ -11,5 +12,6 @@ const posts = await getPosts();
     <h1>{SITE.title}</h1>
     <p>{SITE.description}</p>
   </section>
+  <CategoryNav />
   <PostList posts={posts} />
 </Base>

@@ -3,7 +3,9 @@
 Astro static blog published at https://blog.gnu.or.kr via GitHub Actions on push to `main`. The owner writes in Korean; posts and UI copy are Korean.
 
 ## Adding a post
-- New file in `src/content/posts/<slug>.md` (or `.mdx` when it needs components). Frontmatter: `title`, `description`, `date`, `tags`, optional `updated`, `draft`.
+- New file in `src/content/posts/<slug>.md` (or `.mdx` when it needs components). Frontmatter: `title`, `description`, `date`, `category` (one name from `CATEGORIES` in `src/site.ts`; the build fails on anything else), `tags`, optional `updated`, `draft`.
+- Category = one broad bucket per post; tags = free-form keywords. Don't add a new category without asking the owner.
+- The About page is `src/pages/about.md`. Only put things the owner has stated there.
 - The owner usually explains the substance; your job is structure, diagrams and wording. Don't invent facts, numbers or claims they did not make — ask.
 - Section pattern used so far: a `<Q>` question near the top of each section, then the answer, then a diagram, then the explanation.
 
