@@ -1,6 +1,6 @@
 # blog
 
-https://blog.modus.ai.kr 의 소스입니다. [Astro](https://astro.build) 정적 사이트이고, `main`에 push하면 GitHub Actions가 빌드해서 GitHub Pages로 배포합니다.
+https://blog.gnu.or.kr 의 소스입니다. [Astro](https://astro.build) 정적 사이트이고, `main`에 push하면 GitHub Actions가 빌드해서 GitHub Pages로 배포합니다.
 
 ## 글 쓰기
 

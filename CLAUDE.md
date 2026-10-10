@@ -1,6 +1,6 @@
 # Blog repo notes for Claude
 
-Astro static blog published at https://blog.modus.ai.kr via GitHub Actions on push to `main`. The owner writes in Korean; posts and UI copy are Korean.
+Astro static blog published at https://blog.gnu.or.kr via GitHub Actions on push to `main`. The owner writes in Korean; posts and UI copy are Korean.
 
 ## Adding a post
 - New file in `src/content/posts/<slug>.md` (or `.mdx` when it needs components). Frontmatter: `title`, `description`, `date`, `tags`, optional `updated`, `draft`.
