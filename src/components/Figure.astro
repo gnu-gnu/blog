@@ -1,0 +1,19 @@
+---
+interface Props { caption?: string }
+const { caption } = Astro.props;
+---
+<figure class="diagram">
+  <slot />
+  {caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<style>
+  .diagram { margin: 24px 0 30px; padding: 20px 8px 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
+  .diagram :global(svg) { display: block; width: 100%; height: auto; font-family: inherit; }
+  .diagram :global([data-claude-anchor^="btn-"]) { cursor: pointer; }
+  .diagram :global([data-claude-anchor^="btn-"]:hover rect) { stroke: var(--accent); }
+  figcaption { text-align: center; color: var(--muted); font-size: 13px; margin-top: 6px; }
+  @media (max-width: 640px) {
+    .diagram { margin-left: -8px; margin-right: -8px; padding: 12px 4px 8px; border-radius: 10px; }
+  }
+</style>

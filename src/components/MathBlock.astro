@@ -1,0 +1,8 @@
+---
+// Display math rendered to HTML at build time; KaTeX CSS is bundled with this component.
+import katex from 'katex';
+import 'katex/dist/katex.min.css';
+interface Props { tex: string }
+const html = katex.renderToString(Astro.props.tex, { displayMode: true, throwOnError: true });
+---
+<div class="math" set:html={html} />

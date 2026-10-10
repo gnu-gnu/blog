@@ -1,0 +1,67 @@
+---
+import '../styles/global.css';
+import { SITE } from '../site';
+
+interface Props {
+  title?: string;
+  description?: string;
+  type?: 'website' | 'article';
+}
+const { title, description = SITE.description, type = 'website' } = Astro.props;
+const fullTitle = title ? `${title} · ${SITE.title}` : SITE.title;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+---
+<!doctype html>
+<html lang={SITE.lang}>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{fullTitle}</title>
+  <meta name="description" content={description} />
+  <link rel="canonical" href={canonical} />
+  <meta property="og:title" content={title ?? SITE.title} />
+  <meta property="og:description" content={description} />
+  <meta property="og:type" content={type} />
+  <meta property="og:url" content={canonical} />
+  <link rel="alternate" type="application/rss+xml" title={SITE.title} href="/rss.xml" />
+  <link rel="sitemap" href="/sitemap-index.xml" />
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css" />
+  <script is:inline>
+    try {
+      const t = localStorage.getItem('theme');
+      if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <header class="site-head">
+    <div class="wrap">
+      <a class="brand" href="/">{SITE.title}</a>
+      <nav class="site-nav" aria-label="사이트">
+        <a href="/">글</a>
+        <a href="/tags/">태그</a>
+        <a href="/rss.xml">RSS</a>
+        <button class="theme-toggle" type="button" aria-label="밝은/어두운 테마 전환"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/></svg></button>
+      </nav>
+    </div>
+  </header>
+  <main class="wrap">
+    <slot />
+  </main>
+  <footer class="site-foot">
+    <div class="wrap">
+      © {new Date().getFullYear()} {SITE.author} · <a href={SITE.github}>GitHub</a>
+    </div>
+  </footer>
+  <script is:inline>
+    document.querySelector('.theme-toggle')?.addEventListener('click', () => {
+      const root = document.documentElement;
+      const current = root.dataset.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      const next = current === 'dark' ? 'light' : 'dark';
+      root.dataset.theme = next;
+      try { localStorage.setItem('theme', next); } catch (e) {}
+    });
+  </script>
+</body>
+</html>

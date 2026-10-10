@@ -1,0 +1,26 @@
+---
+// The question a section answers. Readers scan these first, so they stand out.
+---
+<h4 class="q"><span class="q-mark" aria-hidden="true">Q</span><span><slot /></span></h4>
+
+<style>
+  .q {
+    display: flex; gap: 14px; align-items: flex-start;
+    max-width: 860px;
+    margin: 18px 0 22px;
+    padding: 18px 22px;
+    background: var(--accent-soft);
+    border-left: 4px solid var(--accent);
+    border-radius: 0 12px 12px 0;
+    font-size: clamp(19px, 2.3vw, 22px);
+    line-height: 1.5;
+    font-weight: 700;
+    letter-spacing: -.01em;
+  }
+  .q-mark {
+    flex: none; display: inline-grid; place-items: center;
+    width: 32px; height: 32px; border-radius: 50%;
+    background: var(--accent); color: var(--bg);
+    font-size: 16px; font-weight: 800; margin-top: 1px;
+  }
+</style>
