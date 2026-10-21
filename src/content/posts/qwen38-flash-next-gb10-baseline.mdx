@@ -1,0 +1,569 @@
+---
+title: "Qwen3.8-Flash-Next 홈랩 실증 Part I: NVFP4 체크포인트 속의 BF16과 통합 메모리"
+description: "NVFP4 표기 체크포인트를 GB10 두 대에 올리다 시스템이 34분간 멎었다. 바이트의 약 58%가 BF16 PLE였다. PLE를 FP8로 바꾸고 128개 파일로 나눠 TP=2로 기동한 과정과 최적화 전 기준 성능을 기록한다."
+date: 2026-10-21
+category: "AI 인프라"
+tags: ["vLLM", "NVFP4", "GB10", "DGX Spark", "양자화", "통합 메모리", "MoE"]
+draft: false
+---
+
+import Figure from '../../components/Figure.astro';
+import CheckpointBudget from '../../components/diagrams/CheckpointBudget.jsx';
+
+180B급 모델이니 NVFP4면 가중치가 90 GB쯤이고, GB10 두 대를 TP=2로 묶으면 넉넉하겠다고 보고 가볍게 돌렸다. 로딩 도중 시스템이 34분간 멎었고 결국 전원을 강제로 내렸다.
+
+원인은 체크포인트 구성에 있었다. NVFP4로 표기된 체크포인트였지만 바이트의 약 58%가 BF16 PLE(Per-Layer Embedding)였다. PLE는 CPU 메모리에 두도록 설계된 룩업 테이블인데, GB10은 CPU와 GPU가 같은 메모리를 쓴다. PLE를 FP8로 바꾸고 128개 파일로 나눴으며 `lm_head`도 손본 뒤 두 노드에서 기동했다.
+
+기준 성능은 단일 요청 약 19 output tok/s, 동시 요청 8개에서 합계 103.18 tok/s다. 이 글은 구동과 기준 성능까지 다룬다. eager mode, MTP off, 16K context로 고정한 출발선이며 최적화 성능이 아니다. 실증 기록에 독립 감사 기록을 더했고, NVFP4 체크포인트 배포처와 공개 표본은 익명 처리했다. 측정 기준일은 2026년 8월 29일이다.
+
+## 예상과 실제 체크포인트 크기
+
+**산수는 맞았지만, 계산의 입력이었던 "전체가 NVFP4일 것"이라는 전제가 틀렸다.**
+
+저장 형태에서 논리 파라미터를 역산하면 173.8 B이고, 전부 NVFP4(4-bit 가중치 + group-16 FP8 스케일 = 실효 4.5 bit)로 저장하면 91.1 GiB가 나온다. 예상과 거의 일치한다. 실제로 받은 체크포인트는 165.4 GiB였다.
+
+<Figure caption="세 막대는 같은 축척이다. 실제 체크포인트에서 늘어난 부분은 대부분 BF16 PLE다."><CheckpointBudget /></Figure>
+
+Qwen3.8-Flash-Next는 48개 language layer, 512개 routed expert 중 token당 10개 활성화, shared expert, hybrid attention, vision tower, MTP 선언, 그리고 51.2 B parameter의 PLE n-gram embedding으로 구성된다. 각 부분의 저장 정밀도가 다르면 **"모델의 대표 양자화 이름"과 "전체 파일 및 로드 메모리" 사이의 대응이 깨진다.**
+
+가볍게 돌려보는 단계는 이 시점에 끝났다. 원인을 규명하고 재기동하기 위해, 완료 조건을 최고 성능이 아니라 다음 여섯 가지 운영 기준으로 다시 정했다.
+
+1. 두 rank가 동일한 체크포인트와 동일한 런타임 코드 계약으로 기동한다
+2. `/health`, `/v1/models`, 실제 completion이 모두 성공한다
+3. 양 노드 컨테이너가 `OOMKilled=false`를 유지한다
+4. 게이트웨이와 UI에서 고정 display name으로 노출된다
+5. tracing의 request span과 benchmark request를 대응시킬 수 있다
+6. 동시성 1, 2, 4, 8의 기준 성능을 같은 workload에서 확보한다
+
+## 정밀도 구성
+
+**`quantization_config`는 `format: "mixed-precision"`을 선언하며, PLE만 BF16으로 남아 있었다.**
+
+| 구성 요소 | 원본 정밀도 | 용량 | 논리 파라미터 | 비고 |
+| --- | --- | ---: | ---: | --- |
+| routed MoE expert MLP | NVFP4 | 63.28 GiB | 120.8 B | 4-bit 표기의 주 대상 |
+| attention · shared expert | FP8 | 5.86 GiB | 1.9 B | compressed-tensors 설정 |
+| **PLE n-gram embedding** | **BF16** | **95.37 GiB** | **51.2 B** | 128개 텐서 샤드 |
+| `lm_head` | FP8 + row scale | 0.59 GiB | 0.6 B | 런타임과 계약 불일치 |
+| vision tower · norm · gate | BF16 | 0.90 GiB | — | — |
+| KV cache | BF16 (auto) | — | — | weight dtype과 별도 |
+
+PLE는 `20,000,000 × 2,560 = 51,200,000,000`개의 embedding parameter다. BF16이면 parameter당 2 bytes이므로 이 tensor family만 약 102.4 GB가 된다. routed expert를 NVFP4로 줄여도 PLE가 BF16이면 전체가 100 GB를 크게 넘는 것이 정상이다.
+
+### 공개 체크포인트 4종 대조
+
+2026-08-29 기준으로 공개된 NVFP4 표기 체크포인트 4종의 PLE 저장 형식을 model card, `config.json`, file tree와 weight index로 대조했다. **4종 중 3종이 BF16 PLE였다.**
+
+| 표본 | routed expert | PLE | 공개 크기 / index 관측 | 판정 근거 |
+| --- | --- | --- | ---: | --- |
+| A | NVFP4 | FP8 E4M3 | 약 135 GB | `ple_embedding_dtype=float8_e4m3fn` |
+| B | NVFP4 | BF16 | 약 183 GB | 102 GB PLE shard, PLE quant 제외 |
+| **C — 실사용 원본** | NVFP4 | BF16 | 177.60 GB | PLE 102,400,491,520 bytes 직접 계수 |
+| D | NVFP4 | BF16 | 약 186 GB | model card가 BF16 pre-scaled PLE 명시 |
+
+체크포인트 선정 전 최소한 다음 다섯 항목을 확인해야 한다.
+
+- weight index의 PLE tensor dtype과 byte count
+- `config.json`의 PLE dtype 선언
+- quantization exclude/ignore 목록의 `*.ple.*` 및 `ngram_embedding`
+- `lm_head`, MTP, vision tower의 별도 정밀도
+- 런타임이 PLE scale tensor를 실제로 지원하는지 여부
+
+### 용량 산식
+
+```text
+원본 weight index
+  total_parameters              124,545,978,992   (저장 원소 기준)
+  total_size                    177,598,883,320 bytes
+  PLE BF16                      102,400,491,520 bytes
+
+PLE FP8 변환
+  −102,400,491,520
+   +51,200,245,760
+              +2                (global scale, BF16 [1])
+  = 126,398,637,562 bytes
+
+lm_head BF16 복원
+     +635,202,560
+  = 127,033,840,122 bytes  =  118.31 GiB
+```
+
+최종 indexed weight는 약 127.03 GB, 118.31 GiB다. tokenizer, config, stale source 샤드와 부속 파일을 포함한 디렉터리 apparent size는 약 119 GiB다. 최초 예상 90 GB에는 도달하지 않지만, **가용 121 GiB 노드 2대에 TP=2로 배치할 수 있는 수준**으로 내려온다.
+
+### 단일 파일에 몰린 PLE
+
+이 95.37 GiB가 **단일 safetensors 파일**에 들어 있었다.
+
+```text
+shard 01 / 17     4.66 GiB    텐서  9,091개
+shard 02 / 17    95.37 GiB    텐서    128개   ←
+shard 03–17       4.66 GiB씩  텐서 1.5만개씩
+```
+
+로더는 샤드를 파일 단위로 연다. 총량이 맞아도 피크에서 죽는 구조다.
+
+## 실험 환경
+
+**GB10 두 대를 200 Gb/s ConnectX-7로 직결하고, Ray 없이 native multiprocessing으로 TP=2/EP=2를 구성했다.**
+
+| 항목 | Node 1 | Node 2 |
+| --- | --- | --- |
+| accelerator | GB10, sm_121 | GB10, sm_121 |
+| architecture | aarch64 | aarch64 |
+| unified memory | 128 GB LPDDR5x · 가용 약 121 GiB | 128 GB LPDDR5x · 가용 약 121 GiB |
+| 역할 | rank 0, API head | headless rank 1 |
+| local storage | 1TB / 4TB NVMe 혼합 — 용량별 실제 대역폭이 달랐다 | |
+
+제품 정보에는 M.2 Key M NVMe만 명시됐고 PCIe generation이나 실제 SSD bandwidth는 없었다. 같은 계열 장비의 **용량별 구성 사이에 실제 storage bandwidth 차이가 존재한다**는 점은 구매 전에 판단하기 어려웠고, SMART와 PCIe negotiation, 동일 파일 read/write 및 노드 간 복사로 비교하면서 처음 확인했다. 기능 장애가 아니라 운영 시간의 차이지만, 100 GB 이상 체크포인트의 download·sync·cold start에는 누적된다.
+
+```text
+200 Gb/s ConnectX-7 RoCE 직결 2링크
+  NCCL_IB_HCA=<RoCE 장치 2개>       NCCL_IB_ROCE_VERSION_NUM=2
+  NCCL_SOCKET_IFNAME=<200GbE ×2>    GLOO_SOCKET_IFNAME=<200GbE ×1>
+
+vLLM: digest로 핀한 container image
+executor: native multiprocessing (Ray 미사용)
+parallelism: TP=2, PP=1, EP=2
+load format: safetensors lazy load, parallel loading worker 1
+```
+
+Ray는 별도 cluster scheduler와 worker lifecycle이 필요할 때 유용하지만, 고정된 2노드 단일 모델 구성에서는 native multiprocessing이 더 단순했다. rank와 master address, network interface를 명시적으로 고정하고 추가 control plane을 두지 않았다.
+
+## PLE의 구조와 양자화 제외
+
+**PLE는 GEMM이 아니라 gather라서, 양자화기가 의도적으로 BF16으로 남겼다.**
+
+PLE = Per-Layer Embedding. 토큰 3개짜리 n-gram을 해시해 2천만 행 테이블에서 2,560차원 벡터를 꺼내 특정 레이어의 hidden state에 주입한다.
+
+```text
+ngram_size = 3                 heads_per_ngram = 8
+ngram_vocab_size_base = 20,000,000
+split_ngram_parts = 128        ple_embed_dim = 2560
+
+...ple.ple_embedding.ngram_embedding.shard_{0..127}.weight
+  BF16 [2,500,012 × 160] = 762.9 MiB × 128 = 95.37 GiB
+```
+
+텐서코어를 쓰지 않고, 토큰당 실제로 건드리는 행은 극소수다. 양자화기가 임베딩을 제외하는 것은 표준 관행이며 이유도 타당하다.
+
+- 룩업이라 양자화해도 **연산 이득이 0**이다
+- 행이 희소하게 접근되어 per-tensor 스케일이 잘 맞지 않는다
+- 결과가 residual stream에 그대로 더해진다 — 뒤에 오차를 평균 낼 matmul이 없다
+
+`ignore` 목록 751개를 보면 저자가 빠뜨린 것이 아니다. `lm_head`까지 FP8로 눌렀으면서 PLE만 남긴 것은 의도적 선택이었다. **다만 그 선택이 리포지토리 이름에는 반영되지 않았다.**
+
+## 통합 메모리와 설계 전제의 불일치
+
+**PLE를 호스트 RAM에 두는 설계는 VRAM과 RAM이 분리된 장비를 전제하며, GB10에서는 호스트에 내려도 GPU 예산이 줄어든다.**
+
+그러면 그 95 GiB를 어디에 두나. 답은 시스템 메모리다. GPU에는 GEMM에 쓰는 가중치만 올리고 룩업 테이블은 값싼 호스트 RAM에 눕힌다. VRAM과 RAM이 분리된 장비에서는 합리적인 설계다.
+
+런타임도 그 전제로 만들어져 있다. `VLLM_PLE_CPU_OFFLOAD`와 전용 offload layer가 이미 들어 있고 pinned memory, UVA 옵션까지 있다. PLE는 원래 GPU에 올리는 물건이 아니다.
+
+그런데 GB10에는 그 "값싼 호스트 RAM"이 없다. CPU와 GPU가 121 GiB 하나를 나눠 쓴다. 다른 장비에서 이득이던 설계가 여기서는 그대로 독이 됐다.
+
+model weight, CUDA allocation, KV cache, NCCL buffer는 물론이고 OS, container runtime, filesystem cache, rank 0 API process까지 전부 같은 121 GiB 위에 있다. `gpu-memory-utilization 0.75`는 그중 약 90 GiB를 GPU 몫으로 미리 떼어간다. 로더는 남은 30 GiB에 95 GiB짜리 파일을 올리려 했다.
+
+### 128 GB 두 대에 165 GiB가 모자란 이유
+
+단순 계산으로는 남는다. 128 GiB 두 대면 256 GiB이고 모델이 165 GiB니까 90 GiB 가까이 여유가 있어 보인다. 그 계산에는 세 가지가 빠져 있다.
+
+1. **128 GiB가 전부 쓰이지 않는다.** DGX Spark 스펙의 128 GB LPDDR5x는 메모리 용량 표기 관례상 128 GiB지만, firmware와 예약 영역을 빼면 OS가 실제로 쓸 수 있는 양은 121 GiB다. 두 대 합쳐 256 GiB가 아니라 **242 GiB**다.
+2. **가중치만 올리는 게 아니다.** KV cache, CUDA context, NCCL buffer, non-torch 할당이 붙는다. 지금 구성에서 rank당 KV만 22.55 GiB다.
+3. **노드는 비어 있지 않았다.** 특히 Node 1은 rank 0 API에 데스크톱 세션까지 떠 있는 워크스테이션이다.
+
+정상 구동 중인 지금 노드 한 대의 메모리 장부는 이렇다.
+
+| 영역 | GiB | 내용 |
+| --- | ---: | --- |
+| **GPU 예산** (gmu 0.70) | **84.70** | — |
+| ├ 가중치 + non-torch | 60.38 | PLE FP8 23.84 포함 |
+| ├ KV cache | 22.55 | 1,085,166 tokens |
+| └ 남는 몫 | 1.77 | 거의 없다 |
+| **호스트 몫** | **36.30** | — |
+| ├ Node 1 사용 | 20.40 | idle MemAvailable 15.9 · 보호선 12 |
+| └ Node 2 사용 | 8.80 | idle MemAvailable 27.5 · headless |
+
+**Node 1이 Node 2보다 11.6 GiB를 더 쓴다.** OOM 당시 커널이 남긴 프로세스 목록에 그 내역이 있다 — GNOME shell과 Xorg, Chromium, 1Password, VLC, 파일 관리자, 터미널 멀티플렉서, 그리고 여러 개의 코딩 에이전트 프로세스. 벤치마크 전용 서버가 아니라 평소 쓰던 작업용 머신이었다.
+
+여기에 **로딩 피크는 정상 상태보다 크다.** 95 GiB짜리 파일 하나를 여는 순간의 요구량은 정착 후 점유량과 다르다. 부족분은 swap으로 밀렸다. OOM 시점에 vLLM 워커 프로세스 하나만 **10.4 GiB가 swap에 나가 있었고**, 16 GB swap은 전부 소진된 상태였다(`Free swap = 0 kB`). swap이 바닥나자 커널은 reclaim에 갇혔고 `kswapd0`와 `jbd2`까지 멈춰 34분이 지나갔다.
+
+참고로 PLE가 BF16이면 rank당 가중치가 84.23 GiB다. GPU 예산 84.70 GiB를 가중치만으로 거의 다 쓴다. **KV를 잡을 자리가 남지 않는다.**
+
+### 장애 타임라인
+
+| 시각 | 사건 |
+| --- | --- |
+| 13:35:46 | TP=2 서빙 컨테이너 기동 |
+| 13:36:40 | safetensors 샤드 **1/17 완료** — 이후 진행 로그 없음 |
+| 13:36:56 | `NVRM: Out of memory [NV_ERR_NO_MEMORY] @ mem_desc.c:1359` 반복 |
+| 13:38:53 | 첫 글로벌 OOM — `UVM GPU1 BH invoked oom-killer` |
+| 13:40:43 — 14:14:52 | **시스템 완전 정지 34분 09초.** journal 로그 공백. `kswapd0`·`jbd2`·`systemd:1`까지 122초+ blocked. 복귀한 네트워크 데몬이 `time-jumped(34m9s)`를 기록 |
+| 14:15:59 | `Out of memory: Killed process VLLM::Worker_TP` — anon-rss 25 GB. **Free swap = 0 kB** (16 GB 전소) |
+| 14:16:49 | 컨테이너 종료 — `OOMKilled: true` |
+| 14:17:42 | journal 단절. shutdown 시퀀스 없음 — **강제 전원 차단** |
+| 14:19:04 | 재부팅 |
+
+Node 2는 SSH가 유지됐는데 Node 1이 먼저 무너진 것은 우연이 아니다. rank 0이 API와 orchestration을 함께 담당하고 있었고, 두 노드의 host background usage와 storage cache도 같지 않았다. **이 사고 이후 "GPU memory utilization만 맞으면 안전하다"는 가정을 폐기했다.**
+
+### 보호 장치
+
+```text
+GPU_MEMORY_UTILIZATION=0.70        MAX_MODEL_LEN=16384
+MAX_PARALLEL_LOADING_WORKERS=1     OOM_SCORE_ADJ=1000
+MAX_NUM_BATCHED_TOKENS=2048        host MemAvailable 보호선 = 12 GiB
+```
+
+sysctl이나 global OOM policy는 변경하지 않는다. 컨테이너 프로세스의 OOM 희생 우선순위를 높여 desktop session이나 host 전체가 먼저 사라지는 상황을 피한다. watchdog은 host `MemAvailable`이 보호선 아래로 내려가면 해당 컨테이너만 종료한다.
+
+baseline 완료 후 idle spot measurement에서 Node 1 `MemAvailable`은 약 15.9 GiB, Node 2는 약 27.5 GiB였다. **Node 1은 보호선 대비 약 4 GiB만 남는다.** 이후 최적화에서도 peak와 swap 증가를 함께 봐야 한다.
+
+## 혼합 체크포인트 구성
+
+**PLE FP8 변환, `lm_head` BF16 복원, QSA 호환 변경, 최소 범위 런타임 패치의 네 단계로 체크포인트를 다시 만들었다.**
+
+### ① PLE FP8 변환
+
+핀된 이미지의 PLE 레이어 구현 모듈을 직접 확인해 런타임 계약을 특정했다. FP8 loader는 샤드별 스케일이 아니라 **128개 샤드가 공유하는 global scalar 하나**를 요구한다.
+
+```text
+weight : ...ngram_embedding.shard_N.weight
+scale  : ...ngram_embedding.weight_scale        BF16 [1]
+실행   : embeddings.to(output_dtype) * weight_scale
+
+global_max = max(abs(all PLE values))
+scale      = ceil_to_BF16(global_max / 448)
+q          = clamp(weight / scale, -448, 448).to(FP8 E4M3FN)
+
+global_max        = 0.08935546875
+stored BF16 scale = 0.0002002716064453125
+```
+
+BF16 scale을 단순 round-to-nearest하면 필요한 값보다 작아져 최대값이 448을 넘을 수 있다. 변환기는 저장값이 exact scale 이상이 될 때까지 소폭 올려 saturation을 방지한다.
+
+변환은 메모리를 아끼도록 다음 순서로 진행했다.
+
+1. PLE index가 정확히 128개이고 번호가 0–127 연속인지 확인
+2. 각 샤드를 읽으며 global max와 BF16 source byte 계수
+3. manifest를 먼저 저장해 중단 후 global scan 반복을 방지
+4. 샤드 하나를 FP32로 normalize하고 FP8로 변환
+5. finite check 후 temporary에 쓰고 atomic rename
+6. 기존 output 샤드의 dtype·shape가 맞으면 resume
+
+한 샤드를 FP32로 펼치면 약 1.49 GiB다. normalize용과 finite check용 FP32 임시만 약 3.0 GiB이고, BF16 source와 FP8 output, boolean buffer까지 포함한 working set의 보수적 상한은 **약 4.5 GiB**다. 순차 처리이므로 원본 95.4 GiB 전체가 FP32로 확장되는 사고를 피한다.
+
+| 항목 | 변환 전 | 변환 후 |
+| --- | ---: | ---: |
+| PLE 용량 | 95.37 GiB | 47.68 GiB |
+| 파일 수 | 1 | 128 |
+| 로더 피크 할당 | 95 GiB | 0.38 GiB |
+| 변환 working set | — | 약 4.5 GiB |
+
+크기가 절반이 된 것보다 **파일이 128개로 쪼개진 것이 결과적으로 더 중요했다.** 로더 피크 할당이 95 GiB 한 방에서 샤드당 381 MiB로 떨어졌고, 이것이 프리즈의 직접 원인을 제거했다.
+
+### ② `lm_head` 호환 처리
+
+원본 `lm_head.weight`는 FP8 `(248320, 2560)`이고 scale은 row-wise BF16 `(248320, 1)`이다. 핀된 런타임의 `ParallelLMHead`가 이 compressed-tensors row-wise scale parameter를 만들지 않아 weight loading이 중단됐다.
+
+```text
+There is no module or parameter named 'lm_head.weight_scale'
+```
+
+**체크포인트 corruption이 아니라 model implementation과 serialized weight contract의 불일치였다.** `restored = (fp8_weight.float() * row_scale.float()).to(BF16)`로 원래 FP8이 표현하던 값을 BF16 컨테이너에 옮긴 것이므로 이 단계 자체의 추가 양자화 오차는 없다. weight index와 `quantization_config`의 FP8 target에서 `lm_head`를 제거했고, 체크포인트는 635,202,560 bytes 증가했다.
+
+### ③ QSA 호환 변경
+
+핀된 런타임과 맞추기 위해 config의 sparse attention 관련 항목 14개를 `full_attention`으로 바꿨다. **원본 sparse attention path와 동등한 구현이 아니다.** 특히 long context에서 compute·memory·latency가 증가할 수 있으며, 이 baseline에서 262K/1M context 특성을 주장하지 않는 이유가 이것이다.
+
+### ④ 최소 범위 런타임 패치
+
+핀된 image 위의 patch는 두 기능으로 제한했다.
+
+1. mixed compressed-tensors 모델에서도 전용 환경변수가 켜지면 stock FP8 PLE embedding method를 선택한다
+2. lazy safetensors loader가 원본 샤드 파일 안의 stale `lm_head.weight_scale`을 열거할 때 **그 이름 하나만** 무시한다
+
+광범위한 missing-weight 허용이나 loader validation 비활성화는 하지 않았다. upstream image digest와 patch source가 두 노드에서 동일한지는 시작 전 doctor command로 확인한다.
+
+## 노드 간 복제
+
+**전송 프로토콜을 바꿔도 상한이 크게 열리지 않아, rsync over SSH로 돌아가 샤드 파일을 병렬로 보냈다.**
+
+동일한 100 GB 이상 체크포인트를 두 노드가 각각 외부에서 받으면 WAN traffic과 검증 비용이 중복된다. 최종 절차는 Node 2에서 한 번만 받고 변환까지 완료한 뒤 Node 1로 복제하는 방식이었다.
+
+초기 rsync/SSH 실측은 **약 323 MB/s**였다. 목적지 주소와 route를 확인한 결과 이미 ConnectX-7 직결 경로였다. 병목은 link 선택이 아니라 SSH encryption, 단일 stream, filesystem 및 NVMe endpoint 조합이었다.
+
+| 방법 | 목적 | 결과 및 판단 |
+| --- | --- | --- |
+| rsync over SSH 단일 stream | 기준선 | 약 323 MB/s |
+| **rsync 병렬 stream** | 독립 샤드 파일 병렬화 | 최종 실사용 방식 |
+| reliable UDP 자체 구현 | 프로토콜이 병목인지 확인 | 기준선의 약 3.2배였지만 pacing 상한의 약 10%에 그쳐 회귀 |
+| plain TCP multi-stream | SSH overhead 제거 가능성 | storage endpoint가 상한을 지배 |
+| NCCL test | GPU collective fabric 확인 | 파일 복사 수치와 직접 비교 불가 |
+
+### reliable UDP 직접 구현
+
+생각보다 rsync over SSH 속도가 나오지 않아 **전송 프로토콜 자체의 문제를 의심했다.** Aspera, UDT, 삼성SDS Rapidant를 다뤄본 경험이 있어, 같은 계열의 reliable UDP를 한 번 구현해 보기로 했다.
+
+프로토타입은 segment별 CRC32C, missing-range retransmission, 최종 SHA-256을 구현했다. process-local `recvmmsg`, buffer reuse, adjacent write coalescing을 사용했고 sysctl·kernel module·NIC parameter는 변경하지 않았다. 28.92 GB 파일을 20 Gb/s pacing 4 lanes로 전송해 data transfer부터 SHA 검증까지 28.34초였고, initial missing segment는 최적화 전 약 25.7%에서 약 3.4%로 줄었다.
+
+**최적화는 했지만 결과가 생각보다 만족스럽지 않았다.** 약 1.02 GB/s로 rsync 단일 stream의 약 3.2배였지만, 4 lanes × 20 Gb/s pacing 상한(10 GB/s)의 약 10%에 그쳤다. 프로토콜을 바꿔도 상한이 크게 열리지 않았고, 이는 병목이 프로토콜이 아니라 storage와 host path에 있다는 뜻이었다. 새 전송 체계를 운영 경로로 들이지 않고 **그냥 rsync over SSH로 회귀했다.** 대신 독립 샤드 파일을 여러 process로 병렬 전송하는 방식을 택했다.
+
+변환 후 생성한 1.18 GiB 단일 파일은 ConnectX-7 주소를 통한 rsync에서 약 722 MB/s가 측정됐다. 전송 후에는 apparent byte, safetensors 파일 수, 중요 파일 SHA-256을 양쪽에서 비교한다.
+
+변환기는 원본과 output이 같은 filesystem에 있을 때 non-PLE file을 hardlink한다. 로컬에서는 inode를 공유해 중복 disk 사용을 피하지만, **다른 노드로 rsync할 때 hardlink 공유는 풀리므로 약 119 GiB가 실제로 전송된다.**
+
+## 기동 검증
+
+**FP8 PLE의 round-trip 수치 충실도를 원본과 직접 비교했고, 두 rank가 OOM 없이 기동해 API가 정상 응답했다.**
+
+### 수치 충실도
+
+global scalar 스케일이 임베딩 테이블에 맞을지가 우려 사항이었다. 원본 BF16 샤드와 변환된 FP8 샤드를 직접 비교해 측정한 결과, 이 데이터에는 아웃라이어가 없었다. 샤드 0과 63의 중앙값이 `4.974e-03`으로 소수점 4자리까지 일치할 만큼 분포가 균일하다.
+
+| 지표 | 값 |
+| --- | ---: |
+| SNR | 31.52 dB |
+| row cosine 평균 | 0.99965 |
+| row cosine 최저 | 0.99940 |
+| 0으로 소멸 | 0.002% |
+
+SNR과 cosine은 **round-trip 수치 충실도**이지 task 품질이 아니다. PLE FP8 변환 전후의 perplexity, task score, long-context retrieval은 측정하지 않았으며, "품질 손실이 없다"는 결론은 이 글의 범위 밖이다.
+
+알려진 trade-off도 있다. 감사 과정에서 한 샤드의 max가 약 0.0496으로 global max 0.0894보다 작았고, 이 샤드는 shard-local scale 대비 **약 0.85 bit의 유효 정밀도를 잃는다.** 런타임이 scalar 하나만 받으므로 의도적으로 수용한 값이다.
+
+### baseline 런타임 플래그
+
+```text
+tensor_parallel_size=2              max_model_len=16384
+pipeline_parallel_size=1            max_num_seqs=8
+enable_expert_parallel=true         max_num_batched_tokens=2048
+distributed_executor_backend=mp     gpu_memory_utilization=0.70
+enable_chunked_prefill=true         enforce_eager=true
+enable_prefix_caching=true          MTP/speculative decoding=off
+KV cache dtype=auto (BF16)
+```
+
+`max_num_seqs=8`은 항상 요청 8개를 강제하는 값이 아니라 scheduler의 동시 처리 상한이다. 단일 요청에서는 autoregressive dependency 때문에 decode step마다 미래 token을 병렬 생성할 수 없다. 동시 요청이 늘면 여러 sequence의 다음 token을 batch로 묶어 weight access, kernel launch, communication cost를 amortize한다.
+
+### 로딩 결과
+
+| 항목 | 실측 |
+| --- | ---: |
+| indexed safetensors file | 145개 |
+| weight loading | 411.33 s |
+| 전체 model loading | 431.98 s |
+| rank당 model weight + non-torch memory | 60.38 GiB |
+| rank당 KV cache | 22.55 GiB |
+| KV cache capacity | 1,085,166 tokens |
+| 계산 16,384-token 최대 동시성 | 66.23 × |
+| head / worker OOMKilled | false / false |
+
+KV capacity 1,085,166 tokens는 현 설정상 최대 resident sequence token `16,384 × 8 = 131,072`보다 약 8.3배 크다. Part II에서 일부 KV budget을 다른 런타임 기능이나 더 큰 host safety margin으로 돌릴 수 있다는 뜻이다. 다만 hybrid model의 실제 cache layout과 transient memory가 있으므로 단순 비례 계산만으로 값을 정하지 않는다.
+
+functional check — `/health` HTTP 200, `/v1/models` 정상, chat completion 정상 생성, 두 rank가 동일 request에 참여, model stats와 중요 파일 hash 양 노드 일치, benchmark 종료 후에도 API healthy.
+
+## 기준 성능 측정 방법
+
+**4K 입력·1K 출력 고정 workload로 동시성을 1, 2, 4, 8로 늘리며 측정했다.**
+
+동시성 한 지점만 측정하면 그 지점의 throughput만 보이고 saturation curve와 latency trade-off를 알 수 없다. 따라서 동시성을 `1 → 2 → 4 → 8`로 순차 증가시켰다.
+
+| 항목 | 값 |
+| --- | --- |
+| tool / backend | `vllm bench serve`, backend `vllm` |
+| endpoint | `/v1/completions` |
+| tokenizer | local `/model` |
+| dataset | random |
+| input / output length | 4,096 / 1,024 tokens 고정 |
+| random range ratio | 0.0 |
+| EOS | 무시 — 정확히 1,024 tokens 생성 |
+| seed / request rate | 42 / `inf` |
+| concurrency / requests | 1, 2, 4, 8 / 4, 8, 16, 32 |
+
+각 concurrency 지점에서 요청 수를 concurrency의 4배로 두어 네 번의 batch wave를 만들었다. 그럼에도 C1 4개, C2 8개는 통계적으로 작은 표본이다. 본 결과는 system characterization과 후속 A/B baseline이지, 미세한 설정 차이를 판별하는 production capacity study가 아니다.
+
+무효 시도 두 건은 결과에서 제외했다.
+
+- **1차** — served model name을 tokenizer identifier로 해석해 offline 환경에서 원격 resolution을 시도했고 실제 부하를 보내지 못했다. `--tokenizer /model`로 수정했다.
+- **2차** — 핀된 CLI에서 `random-range-ratio=1.0`이 최소 input length 0을 만들어 유효한 4K workload가 아니었다. `0.0`으로 고정해 재측정했다.
+
+benchmark 도구가 정상 종료했다는 사실보다, 실제 요청 수와 token count, server span이 생성됐는지를 검증해야 한다.
+
+지표는 다음과 같이 정의했다.
+
+- **output throughput** — 모든 completion token / benchmark wall time
+- **total token throughput** — (prompt + completion) tokens / wall time
+- **TTFT** — request 시작부터 첫 token까지
+- **TPOT** — 첫 token 이후 output token당 평균 시간
+- **ITL** — 연속한 output token 사이 시간
+- **prefill / decode time** — 서버 내부 단계별 기록
+- **E2E** — request 수신부터 완료까지 server-side elapsed time
+
+4K:1K workload에서는 total token throughput이 구조적으로 output throughput의 약 5배다. **decode capacity를 설명할 때 total tok/s를 output tok/s처럼 사용하지 않는다.**
+
+## 기준 성능 결과
+
+**합계 출력 처리량은 C8에서 103.18 tok/s까지 늘지만, TTFT P95는 C4의 2.89초에서 C8의 13.57초로 악화된다.**
+
+### 클라이언트측 serving 지표
+
+| 동시성 | 요청 | 소요(s) | output tok/s | total tok/s | TTFT P50/P95(s) | TPOT P50/P95(ms) | ITL P50/P95(ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4/4 | 214.84 | 19.07 | 95.33 | 0.741 / 0.770 | 51.53 / 52.72 | 52.09 / 56.77 |
+| 2 | 8/8 | 233.44 | 35.09 | 175.46 | 0.546 / 1.576 | 56.04 / 58.63 | 56.55 / 62.53 |
+| 4 | 16/16 | 248.33 | 65.98 | 329.89 | 0.892 / 2.888 | 59.66 / 61.02 | 59.50 / 65.03 |
+| 8 | 32/32 | 317.58 | 103.18 | 515.90 | 3.979 / 13.573 | 72.83 / 75.36 | 62.72 / 82.61 |
+
+### 서버측 지표
+
+request id를 benchmark prefix와 대응시켜 동일 요청만 집계했다. 아래 prefill/decode rate는 *해당 token 총계 / 단계별 기록 시간의 합*이다. 동시 요청의 시간이 서로 중첩되므로 **system wall-clock throughput이 아니며, 총용량은 위 표의 output tok/s로 판단한다.**
+
+| 동시성 | prompt / output tokens | prefill 평균(s) | 요청당 prefill tok/s | decode 평균(s) | decode tok/s | E2E 평균(s) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 16,384 / 4,096 | 0.711 | 5,759.73 | 52.976 | 19.33 | 53.707 |
+| 2 | 32,768 / 8,192 | 0.496 | 8,257.04 | 57.636 | 17.77 | 58.343 |
+| 4 | 65,536 / 16,384 | 0.817 | 5,013.95 | 60.970 | 16.80 | 62.056 |
+| 8 | 131,072 / 32,768 | 2.990 | 1,369.80 | 73.967 | 13.84 | 79.270 |
+
+### 해석
+
+**합계 출력 처리량** — 동시성 1에서 8로 갈 때 19.07 → 103.18 tok/s, 증가율 5.41배다. 한 request가 103 tok/s로 빨라진 것이 아니라 여러 sequence의 다음 token을 한 batch에서 계산해 GPU utilization과 kernel efficiency를 높인 결과다.
+
+**요청당 decode** — TPOT P50은 51.53 → 72.83 ms로 늘었다. 단일 request의 환산 decode 속도는 약 19.4 → 13.7 tok/s로 *감소*한다. 각 request는 느려지지만 동시 처리 수가 더 크게 늘어 aggregate가 증가한다.
+
+**TTFT와 그 기전** — 동시성 4까지 P50은 1초 이내다. 동시성 8에서 P50 3.979초, P95 13.573초로 무너진다. 서버측 지표에서도 같은 경합이 보인다. 요청당 prefill 속도가 C2의 8,257 tok/s에서 **C8의 1,370 tok/s로 6배 떨어진다.** 긴 prompt 8개를 한꺼번에 넣으면 chunked prefill과 decode가 같은 자원을 두고 다툰다. 처리량만 보면 C8이 낫지만, 대화형 지연까지 보면 결론이 다르다.
+
+**C2의 P50 역전** — C2 TTFT P50 0.546초가 C1 0.741초보다 낮다. 표본이 8개로 작고 scheduling 및 prefix/cache 상태가 섞여 있으며, mean TTFT는 C1 738.6 ms, C2 714.9 ms로 차이가 작다. **성능 역전이 아니라 측정 변동으로 취급한다.**
+
+### 운영상 baseline 판정
+
+| 구분 | 판정 |
+| --- | --- |
+| 단일 사용자 | C1 — 약 19 output tok/s |
+| **대화형 다중 사용자** | C4 — 현 시점 interactive latency/throughput 균형 후보 |
+| 처리량 우선 | C8 — 약 103 output tok/s 상한 |
+| 안정성 | 전체 60개 유효 요청 실패 0, 양 노드 `OOMKilled=false` |
+
+"C4가 최적"이라는 최종 결론은 아니다. 측정한 네 지점 중 interactive service 후보로 균형이 가장 좋다는 baseline 판정이며, Part II에서 런타임 설정을 바꾸면 knee point도 이동할 수 있다.
+
+## 이 baseline이 주장하지 않는 것
+
+**품질, 반복 재현성, 최적화 설정, long context는 이 글의 측정 범위 밖이다.**
+
+| # | 제한 | 내용 |
+| ---: | --- | --- |
+| 1 | 품질 미측정 | PLE FP8 전후 perplexity·task score·long-context retrieval 비교 없음 |
+| 2 | 작은 serving 표본 | C1/C2 요청 수가 4·8개 — 미세한 차이 판정 불가 |
+| 3 | 기동 1회 기준 | cold start와 run-to-run variance를 분리하지 않음 |
+| 4 | eager mode | CUDA graph / compile 최적화 미사용 |
+| 5 | MTP off | speculative decoding 없는 기준선 |
+| 6 | QSA 대체 | sparse attention 일부를 full attention으로 — 원본 long-context 특성과 다름 |
+| 7 | 16K context | native 262K 이상의 memory/latency 미검증 |
+| 8 | tracing 구조 | gateway와 서버 span이 단일 parent-child chain으로 연결되지 않음 |
+| 9 | 단일 workload | 4K→1K random token만. short prompt·long output·multimodal·tool-use 미포함 |
+| 10 | 재배포 범위 밖 | 변환 체크포인트는 local operation용. derivative distribution 조건은 이 글의 범위 밖 |
+
+관측 측면의 실무 주의사항도 하나 남는다. 현재 trace 설정은 prompt와 response 본문도 저장하므로, 민감한 입력을 수집하지 않으려면 content capture policy를 별도로 정해야 한다. credential은 secret manager reference로만 주입하고 config file이나 실행 로그에 평문으로 남기지 않는다.
+
+## 후속 실험 계획
+
+**Part II는 같은 workload에서 한 변수씩 바꿔 성능 변화의 원인을 분리하고, 개선율이 run-to-run variance보다 작으면 채택하지 않는다.**
+
+고정 조건은 다음과 같다.
+
+- 동일 checkpoint와 동일 두 node, 동일 TP=2/EP=2 topology와 network interface
+- 동일 4,096 input / 1,024 output, `ignore-eos`, seed 42
+- concurrency 1, 2, 4, 8
+- warm-up과 main run 분리
+- 설정별 3회 이상 fresh start, 각 지점 request 수 확대
+- raw JSON과 tracing span request ID 보존
+
+| 단계 | 변경 변수 | 주요 질문 |
+| ---: | --- | --- |
+| 0 | 현재 baseline 재측정 | run-to-run variance는 얼마인가 |
+| 1 | `ENFORCE_EAGER=0` | CUDA graph/compile이 C1 TPOT와 C8 throughput을 개선하는가 |
+| 2 | `MAX_NUM_BATCHED_TOKENS` | prefill/decode 경쟁과 TTFT tail을 줄일 수 있는가 |
+| 3 | scheduler · `MAX_NUM_SEQS` | interactive knee point가 C4에서 이동하는가 |
+| 4 | `GPU_MEMORY_UTILIZATION` | KV capacity를 유지하면서 host safety를 넓힐 수 있는가 |
+| 5 | MTP — speculative token 1/2/3 | C1/C2 latency가 acceptance overhead를 상쇄하는가 |
+| 6 | 최적값 결합 | 개별 개선이 함께 적용될 때 유지되는가 |
+
+| 사용 시나리오 | 1차 지표 | 2차 지표 |
+| --- | --- | --- |
+| 단일 사용자 | C1 output tok/s, TPOT | TTFT P50/P95 |
+| 대화형 다중 사용자 | C4 output tok/s | TTFT/TPOT P95, 실패율 |
+| batch 처리 | C8 output tok/s | E2E, GPU utilization |
+| 안정성 | OOM 0, API success | `MemAvailable`, swap 증가, restartability |
+
+throughput이 올라도 TTFT tail이나 host safety를 크게 악화시키면 workload-specific option으로 분리한다. 최종 보고서는 단일 "최고 tok/s"보다 interactive profile과 batch profile을 별도로 제시한다.
+
+### MTP의 선행 조건
+
+MTP는 남는 메모리를 소비해 속도를 올리는 기능이 아니다. draft predictor가 후보를 만들고 target model이 여러 token을 검증해 decode iteration당 accepted token 수를 늘린다. 효과는 draft overhead, acceptance rate, target batch utilization에 따라 달라진다.
+
+구조상의 여지는 있다. KV capacity 1,085,166 tokens가 설정상 최대 131,072보다 훨씬 크므로 MTP weight와 buffer가 수 GiB를 써도 KV allocation을 줄여 재배분할 수 있고, C1 throughput이 C8 aggregate의 약 18.5%인 점도 low-concurrency compute parallelism이 남아 있을 가능성을 시사한다.
+
+다만 현재 체크포인트 index에는 MTP loader가 요구하는 `mtp.*`, `fc_embedding`, `fc_hidden`, `layers.48` 계열 weight가 **존재하지 않는다.** config에는 MTP 1 layer가 선언돼 있지만 serialized tensor가 없다. speculative token만 켜는 실험은 load failure 또는 잘못된 weight 계약으로 이어진다. 다른 parent checkpoint의 MTP head를 임의로 결합하면 acceptance rate와 품질이 모두 변하므로 사용하지 않는다. **정확히 대응하는 MTP weight를 확보하고 index·shape·dtype을 검증한 뒤에만 진행한다.**
+
+### 이종 PP: 시스템 RAM이 넉넉한 노드 편입
+
+3090 ×2 NVLink 노드(VRAM 48 GB, 시스템 RAM 128 GB)를 PP 앞단 스테이지로 편입하는 구성이다. 핀된 이미지의 소스를 읽어 필요한 세 기능이 모두 존재함을 확인했다.
+
+| 필요한 기능 | 지원 | 근거 |
+| --- | --- | --- |
+| 불균등 PP 레이어 분할 | 있음 | `VLLM_PP_LAYER_PARTITION="3,45"` — `get_pp_indices`가 명시 분할을 수용 |
+| 스테이지별 다른 양자화 포맷 | 가능 | `_check_scheme_supported`가 레이어별 호출이고, PP 범위 밖 레이어는 `PPMissingLayer`로 생성되지 않음 |
+| PLE를 호스트 RAM에 상주 | 있음 | `VLLM_PLE_CPU_OFFLOAD=1` — 전용 offload layer, pinned memory + UVA 옵션 |
+
+```text
+스테이지 0 — 3090 ×2 (NVLink), layers 0–2 + PLE
+  VRAM  GPU당 약 5 GiB / 24 GB
+  RAM   PLE 95.37 GiB — BF16 원본 그대로 (시스템 RAM 128 GB, 32 GiB 여유)
+
+스테이지 1 — GB10 ×2 (ConnectX-7), layers 3–47, NVFP4 유지
+  가중치 GB10당 32.16 GiB   ←   현재 59.15 GiB 대비 26.99 GiB 해방
+  스테이지 간 통신: 토큰당 activation 약 5 KB
+```
+
+**여기서는 PLE를 BF16 원본 그대로 쓴다.** 3090 노드는 VRAM 48 GB와 시스템 RAM 128 GB가 물리적으로 분리돼 있다. PLE가 GPU 예산을 건드리지 않으니 FP8로 누를 이유가 없다. 95.37 GiB를 얹어도 32 GiB가 남고, FP8 변환이 감수했던 0.85 bit 손실도 되돌린다. 이 사건을 일으킨 조건 자체가 그 노드에는 없다.
+
+남은 과제는 둘이다. 3090은 NVFP4를 지원하지 않으므로 layers 0–2의 전문가를 INT4 W4A16이나 BF16으로 재양자화해야 한다(3층분 약 7.55 B 파라미터). 그리고 노드당 GPU가 2/1/1로 불균일한 토폴로지를 런처가 감당하게 해야 한다.
+
+PP 처리량은 가장 느린 스테이지가 결정하므로 **이 구성은 처리량을 높이지 않는다.** 3090 노드는 사실상 PLE를 들고 있는 메모리 호스트이고, 얻는 것은 GB10의 메모리 여유다.
+
+### 실행 순서
+
+이종 PP를 MTP보다 먼저 한다. 이유는 셋이다.
+
+1. **선행 조건의 성격이 다르다.** MTP는 외부 weight 확보에 의존하며 시점을 통제할 수 없다. 이종 PP는 런타임 기능이 모두 확인됐고, 남은 작업(재양자화 + 런처)이 직접 손댈 수 있는 범위다.
+2. **순서상 이종 PP가 MTP를 돕는다.** GB10당 26.99 GiB가 해방되면 MTP weight와 buffer를 올릴 여유가 그만큼 커진다. 반대 순서로는 이 이점이 없다.
+3. **제한사항 7번을 부분적으로 해소한다.** 확보된 메모리는 KV가 저렴한 이 구조에서 거의 그대로 컨텍스트와 배치로 전환되므로, 16K에 묶여 있는 검증 범위를 넓힐 수 있다. 다만 6번(QSA 대체)은 그대로라 원본 long-context 특성까지 검증되지는 않는다.
+
+다만 이종 PP는 단계 0~4를 마친 뒤에 착수한다. 토폴로지를 바꾸면 기존 baseline과 비교할 수 없게 된다. 단일 변수 실험이 끝나기 전에 노드 구성을 건드리면 원인을 분리하지 못한다. 이종 PP는 그 자체로 새 baseline을 필요로 하는 변경이다.
+
+순서는 `0 → 1 → 2 → 3 → 4`(단일 변수, 기존 토폴로지) → 이종 PP 전환과 새 baseline 확정 → MTP(weight 확보 시점에)다.
+
+## 배치 판단의 기준
+
+**모델명에 표시된 대표 정밀도만으로는 deployment cost를 계산할 수 없고, 하드웨어와 모델의 설계 전제가 맞는지도 따로 확인해야 한다.**
+
+PLE처럼 연산량은 작아도 parameter 수와 memory footprint가 큰 구성 요소가 있으면, 대표 정밀도로 계산한 크기와 실제 로드 메모리가 크게 어긋난다. PLE를 BF16으로 둔 선택은 CPU와 GPU 메모리가 분리된 장비를 전제한다. 통합 메모리에서는 그 전제가 성립하지 않는다. 다른 곳에서 이득이던 설계가 여기서는 비용이 됐다.
+
+감사 과정에서 확인한 것 셋을 덧붙인다.
+
+- **샤드 크기가 총 용량만큼 중요하다.** 로더는 파일 단위로 연다. 프리즈를 막은 것은 크기 절감보다 128개 분할이었다.
+- **계약 불일치는 손상이 아니다.** `lm_head` 오류를 그렇게 규정하니 해법이 최소 범위로 좁혀졌다.
+- **런타임 소스를 읽는 것이 추측을 대체한다.** PP 불균등 분할과 PLE CPU offload는 이미 구현돼 있었다. 열어보지 않았다면 없다고 결론 냈을 것이다.
+
+**Part I이 확정한 것은 출발선이다.** 19.07 / 103.18 tok/s는 최적화된 값이 아니다. eager mode를 끄지 않았고, MTP는 켜보지도 못했고, 컨텍스트는 native 상한의 6%에 묶여 있다. KV capacity가 설정상 최대의 8.3배로 남았다는 것이 아직 쓰지 않은 여유를 말해준다.
+
+## 데이터와 범위
+
+**공개 자료는 기준 성능 측정 집계이며, 결론은 2026년 8월 29일 기준의 두 노드 구성과 단일 workload에 한정된다.**
+
+본문 수치는 2026년 8월 29일까지의 실측 기록에 근거한다. 공개 자료에는 본문 표의 집계값만 담았다. raw benchmark JSON, 변환기·복원기·런타임 패치·실행 스크립트·memory watchdog은 포함하지 않았다.
+
+- [동시성별 클라이언트·서버측 성능 집계 CSV](/data/qwen38-flash-next-gb10-baseline/benchmark.csv)
+- [체크포인트 구성 요소별 정밀도와 용량 CSV](/data/qwen38-flash-next-gb10-baseline/checkpoint-components.csv)
+
+NVFP4 체크포인트 배포처와 공개 표본은 익명 처리했다. 품질, run-to-run variance, long context, 다른 workload는 별도로 검증해야 하며, Part II에서 같은 workload로 이어서 측정한다.
