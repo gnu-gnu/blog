@@ -1,0 +1,234 @@
+---
+title: "8GB Jetson Orin Nano에서 sLLM과 35B MoE 돌리기: 토큰당 읽는 바이트와 NVMe 스트리밍"
+description: "메모리 7.4 GiB 보드에서 덴스 sLLM 3종과 MoE 2종을 측정했다. 20 GiB짜리 35B-A3B는 expert를 NVMe에서 mmap으로 읽으며 decode 1~3 tok/s를 냈다. expert 읽기를 빠르게 하려는 다섯 가지 시도 중 일관된 이득을 낸 것은 패치 없이 스레드를 코어보다 많이 준 -t 12 하나였다."
+date: 2026-10-28
+category: "AI 인프라"
+tags: ["llama.cpp", "Jetson", "sLLM", "MoE", "mmap", "NVMe", "통합 메모리", "Gemma 4", "Qwen"]
+draft: false
+---
+
+import Figure from '../../components/Figure.astro';
+import DenseBandwidthBound from '../../components/diagrams/DenseBandwidthBound.jsx';
+import KvByContext from '../../components/diagrams/KvByContext.jsx';
+import JetsonMemoryTiers from '../../components/diagrams/JetsonMemoryTiers.jsx';
+import MoeExpertPath from '../../components/diagrams/MoeExpertPath.jsx';
+import NvmeThroughput from '../../components/diagrams/NvmeThroughput.jsx';
+import DecodeVsNvme from '../../components/diagrams/DecodeVsNvme.jsx';
+import DecodeThreadTime from '../../components/diagrams/DecodeThreadTime.jsx';
+import ExpertReadExperiments from '../../components/diagrams/ExpertReadExperiments.jsx';
+
+Jetson Orin Nano Super 8GB에서 OS가 보는 메모리는 7.4 GiB다. 여기에 20 GiB짜리 Qwen3.6-35B-A3B(MXFP4)를 올리면 llama.cpp는 expert 가중치를 NVMe에서 mmap으로 읽으면서 decode 1~3 tok/s를 낸다. 같은 보드에서 Gemma 4 E2B는 29.6 tok/s다.
+
+이 차이는 파라미터 수보다 토큰마다 어디에서 몇 바이트를 읽는지로 설명된다. 덴스 sLLM 3종과 MoE 2종을 측정하고, 35B-A3B의 expert 읽기를 NVMe I/O와 스레드 상태로 나눠 봤다. 그다음 expert 읽기를 빠르게 하려는 다섯 가지 방법을 시험했다. 같은 조건에서 decode를 일관되게 높인 것은 패치 없이 계산 스레드를 코어 수보다 많이 준 `-t 12` 하나였다(세션별 +14~34%).
+
+이 보드의 초기 측정값도 같은 바이너리와 같은 GGUF로 다시 쟀다. TG는 재현됐지만 PP는 측정 방식 때문에 처리량으로 쓸 수 없었다.
+
+## 측정 환경
+
+**JetPack 6.2.3의 MAXN_SUPER 모드에서 llama.cpp CUDA 빌드 하나로 모든 수치를 쟀다.**
+
+| 항목 | 값 |
+| --- | --- |
+| 보드 | Jetson Orin Nano Super 8GB 개발자 키트, GUI 없음 |
+| 소프트웨어 | JetPack 6.2.3(L4T R36.5.2), 전력 모드 MAXN_SUPER |
+| 추론 엔진 | llama.cpp b1-19ff817, CUDA 12.6, SM87 |
+| 메모리 | LPDDR5, OS에서 보이는 용량 7.4 GiB, 공칭 102 GB/s, GPU 읽기 실측 81.4 GB/s |
+| 저장 장치 | NVMe 500GB, PCIe Gen3 x4 링크(8.0 GT/s ×4 확인) |
+| 모델 | Gemma 4 E2B·E4B Q4_K_M, Qwen3.5-9B IQ4_XS, Gemma 4 26B-A4B·Qwen3.6-35B-A3B MXFP4_MOE |
+
+GPU 읽기 대역폭은 1 GiB 버퍼를 읽는 커널을 20회 연속 실행해 측정한 최댓값이다.
+
+## 속도를 정하는 두 값
+
+**배치 크기 1인 decode의 상한은 대략 메모리 대역폭을 토큰당 읽는 바이트로 나눈 값이다.**
+
+decode는 토큰 하나를 만들 때마다 활성 가중치를 메모리에서 한 번씩 읽는다. 연산보다 메모리 읽기가 오래 걸리므로 TG 상한은 대략 `메모리 대역폭 ÷ 토큰당 읽는 바이트`다. prefill은 여러 토큰이 같은 가중치를 공유하는 행렬곱이라 연산 한계에 더 가깝다. Gemma 4 E2B의 pp512(916 tok/s)가 tg128(29.6 tok/s)의 31배인 것도 이 구조와 맞는다.
+
+<Figure caption="상한은 실측 GPU 읽기 대역폭 81.4 GB/s를 CUDA0 가중치 버퍼 크기로 나눈 값이다. 실측은 llama-bench tg128, 3회 평균."><DenseBandwidthBound /></Figure>
+
+덴스 3종의 실측 TG는 이 상한의 54~77%였다. Qwen3.5-9B가 상한에 가장 가까웠고, Gemma 두 모델의 효율이 낮은 원인은 확인하지 않았다.
+
+이 보드는 CPU와 GPU가 LPDDR5 하나를 공유한다. 가중치, KV cache, 런타임, OS가 모두 7.4 GiB를 나눠 쓴다. 그래서 모델을 고를 때는 파라미터 수보다 두 값이 더 직접적인 기준이 된다. 메모리에 상주해야 하는 바이트와 토큰마다 읽어야 하는 바이트다.
+
+## 최근 sLLM 설계 방향
+
+**이번에 다룬 모델들은 모두 상주 바이트와 토큰당 읽는 바이트 중 하나 이상을 줄이는 구조를 갖고 있다.**
+
+| 방식 | 이번에 다룬 모델 | 줄이는 값 | 대가(이번 측정) |
+| --- | --- | --- | --- |
+| Sparse MoE(소수 expert만 활성) | Gemma 4 26B-A4B(활성 3.8B), Qwen3.6-35B-A3B(레이어당 routed expert 256개) | 토큰당 읽는 바이트 | 전체 가중치는 어딘가에 저장해야 한다. 토큰마다 다른 expert를 읽어 접근 위치가 흩어진다. 메모리보다 크면 NVMe 읽기가 decode 속도에 영향을 준다. |
+| PLE(Per-Layer Embeddings) | Gemma 4 E2B/E4B | 가속기에 올려야 하는 바이트 | 저장 용량이 '유효 파라미터'보다 크다. E2B는 추론 시 2.3B 모델처럼 동작하지만 디스크에서는 5.1B를 차지한다 [3]. |
+| 하이브리드 선형 어텐션 | Qwen3.5 소형 dense 0.8B~9B(Gated DeltaNet과 full attention을 3:1로 배치) [4] | 레이어 수에 비례하는 KV cache | full attention 레이어의 KV는 여전히 컨텍스트에 비례한다. recurrent state는 50 MiB로 고정이다. |
+| Sliding window + full attention | Gemma 4 E2B/E4B(window 512) | 레이어 수에 비례하는 KV cache | SWA 레이어는 크기가 고정(E2B 12 MiB, E4B 40 MiB)이고, full attention 레이어만 컨텍스트에 비례한다. |
+| 저비트 포맷 | MXFP4(MoE), IQ4_XS, Q4_K_M | 두 값 모두 | 품질 손실. 이번에 측정하지 않았다. |
+
+<Figure caption="llama.cpp 로드 로그의 KV buffer와 RS buffer 합(f16, 단일 시퀀스). Qwen3.5-9B 128K는 4 GiB KV 할당에 실패했다."><KvByContext /></Figure>
+
+토큰당 KV는 Qwen3.5-9B가 32 KiB, Gemma 4 E4B가 16 KiB, E2B가 6 KiB였다. 9B는 선형 어텐션 레이어가 KV를 쓰지 않는데도 full attention 레이어의 KV가 E4B의 두 배다. 그래서 같은 메모리에서 쓸 수 있는 컨텍스트가 더 짧다. 9B 32K와 E4B 128K는 KV가 할당됐지만 둘 다 fit 검사 실패 메시지가 났고(로드는 계속됨), 긴 입력으로 생성까지 해 보지는 않았다. 64K는 시험하지 않았다.
+
+PLE 테이블은 행렬곱이 아니라 행 조회에만 쓰이므로 가속기 밖에 둘 수 있다 [3]. E2B 가중치 중 CUDA0에 올라간 것은 1.37 GiB였다. 나머지 1.71 GiB는 GPU 밖에 남았고, 그래프에서 `GET_ROWS`로만 읽혔다. 남는 위치는 로드 모드에 따라 다르다. `--load-mode mmap`이면 회수 가능한 `CPU_Mapped`에, 기본값이면 pinned `CUDA_Host`에 놓인다.
+
+엣지에 올리기 전에 확인할 항목은 다음과 같다.
+
+- **메모리 예산**: KV cache와 런타임 버퍼까지 포함한다.
+- **속도**: prefill과 decode를 따로 측정한다.
+- **품질**: 양자화 형식별로 확인한다.
+- **reasoning 제어**: chat template의 thinking 설정이 실제로 적용되는지 확인한다. Gemma 4는 `--reasoning-budget 0`만으로는 thinking이 꺼지지 않았다.
+- **전력·발열**: 초기 측정에서 5개 모델을 연속 실행했을 때 보드 최대 전력은 18.2 W, GPU 최고 온도는 54°C였다.
+
+## 오프로드와 스트리밍
+
+**통합 메모리 보드에서 'CPU로 오프로드'는 같은 DRAM 안에서 연산 주체만 바꾸고, 용량 경계는 DRAM과 NVMe 사이 하나다.**
+
+| 기법 | 가중치 위치 | 연산 위치 | 토큰마다 경계를 넘는 것 | 예 |
+| --- | --- | --- | --- | --- |
+| 레이어 오프로드 | 일부 레이어를 system RAM에 | 해당 레이어는 CPU | 활성값(작음) | llama.cpp `-ngl N` |
+| UVA 가중치 오프로드 | pinned system RAM | GPU | GPU 커널이 interconnect 너머의 가중치를 직접 읽음 | vLLM `--cpu-offload-gb` [5] |
+| prefetch 오프로드 | system RAM | GPU | 레이어 그룹 단위 비동기 H2D 복사로 다음 레이어를 미리 가져옴 | vLLM `offload_group_size` [5] |
+| MoE expert 오프로드 | routed expert를 system RAM에 | expert는 CPU, attention과 shared는 GPU | 활성값 | llama.cpp `--cpu-moe`, `--n-cpu-moe`, `-ot` [1] |
+| mmap / flash 스트리밍 | NVMe(OS page cache가 캐시 역할) | CPU 또는 GPU | 캐시 미스가 난 바이트(NVMe 읽기) | llama.cpp mmap, LLM in a flash [6], Flash-MoE [2] |
+
+vLLM의 `cpu_offload_gb`는 오프로드할 가중치를 pinned CPU 메모리에 두고, forward마다 GPU가 zero-copy로 읽는다. 문서에도 빠른 CPU–GPU interconnect가 필요하다고 적혀 있다 [5]. 같은 코드에는 레이어 그룹을 비동기로 미리 가져와 전송 지연을 숨기는 prefetch backend가 따로 있다. MoE expert 오프로드는 항상 쓰이는 attention과 shared FFN을 GPU에 두고, routed expert는 CPU 메모리에 둔 채 CPU가 계산한다. dense 모델은 모든 가중치를 매 토큰 쓰므로 이 방식의 이득이 작다 [1].
+
+flash 스트리밍은 가중치가 DRAM보다 클 때 쓴다. Apple의 LLM in a flash는 가중치를 flash에 두고 필요할 때 DRAM으로 읽는다 [6]. 최근 활성화된 뉴런을 재사용하는 windowing으로 전송량을 줄이고, row-column bundling으로 연속된 큰 덩어리를 읽는다. 이렇게 DRAM 용량의 최대 2배 크기 모델을 실행했다. Flash-MoE는 같은 접근을 MoE expert에 적용했다 [2]. Qwen3.5-397B-A17B를 48 GB M3 Max에서 5.5 GB만 상주시킨 채 expert를 SSD에서 병렬 `pread`로 읽어 4.4 tok/s를 냈다고 보고했다. 하드웨어가 달라 이번에 재현하지 않았다.
+
+<Figure caption="네 구역은 크기 비율이 아니라 종류를 나타낸다. NVMe 처리량은 35B-A3B decode 구간의 요청별 평균 범위다."><JetsonMemoryTiers /></Figure>
+
+이 보드에서는 CUDA0와 CPU_Mapped가 같은 LPDDR5다. 'CPU로 오프로드'해도 메모리가 비지 않고, 바뀌는 것은 연산 주체와 그 페이지를 회수할 수 있는지뿐이다. mmap으로 매핑한 가중치는 회수 가능한 page cache로 잡히므로 RAM보다 큰 파일도 로드된다. pinned 메모리처럼 회수할 수 없는 경로를 타면 로드가 실패한다.
+
+이 빌드에서 `--load-mode auto`는 iGPU를 만나면 `load_mode = none`으로 로드했다. 이때 Gemma E2B의 GPU 밖 가중치 1,756 MiB는 pinned `CUDA_Host`에 올라갔다. 메모리에 들어가는 모델은 이래도 문제가 없다. 하지만 20 GiB짜리 35B-A3B는 초기 설정 과정에서 다음 순서로 실패와 우회를 거쳤다.
+
+1. pinned 할당 실패(NvMap ENOMEM)
+2. `--no-host`를 준 뒤에는 ARM용 `CPU_REPACK`의 18 GB malloc 실패
+3. 최종적으로 `--load-mode mmap --no-host --no-repack --cpu-moe` 조합에서 로드
+
+llama.cpp는 `--mmap`/`--no-mmap`을 `--load-mode`로 통합하고 있다 [7].
+
+## 35B-A3B의 expert 읽기
+
+**decode 중 NVMe는 동시 I/O 1~2개 수준으로만 쓰였고, decode 속도는 회차별 NVMe 처리량과 함께 움직였다.**
+
+<Figure caption="--cpu-moe와 mmap 조합에서 토큰 하나가 레이어 하나를 지나는 경로. router는 GPU에 남고 routed expert 가중치만 CPU 쪽 mmap 영역에 있다."><MoeExpertPath /></Figure>
+
+같은 서버(`-c 4096`, `-t 6`)에 21~32토큰 프롬프트 5종을 보내고, 요청마다 `/sys/block/nvme0n1/stat`의 변화량을 기록했다. cold 조건은 요청 전에 모델 파일 페이지를 `posix_fadvise(DONTNEED)`로 비운 경우다.
+
+- **토큰당 expert 읽기량**: routed expert 17.71 GiB × 8/256 = 594 MB를 토큰마다 읽는다. 실제 디스크 읽기는 decode 토큰당 146~279 MB였다(10회). 바이트 기준으로 25~47%가 NVMe에서, 나머지는 page cache에서 왔다. warm 5회의 decode 읽기량은 같은 프롬프트의 cold 1토큰 요청 읽기량을 빼서 추정했다. readahead 때문에 디스크 읽기량이 실제 필요량보다 많게 잡혔을 수 있다.
+- **요청 간 캐시 효과 없음**: prefill에서 이미 6.6~7.9 GiB를 읽는데, page cache는 3.1~3.6 GiB다. 다음 요청까지 남는 캐시가 없어서 cold와 warm의 decode 평균이 2.00과 1.99 tok/s로 같았다.
+- **I/O 형태**: decode 중 평균 I/O 크기는 약 70~75 KiB, 동시에 처리 중인 I/O는 평균 1.0~1.4개였다(8회). 아래 그림처럼 같은 파일에 대한 fio 랜덤 읽기의 QD1~2 수준이다.
+
+<Figure caption="decode 막대는 같은 세션에서 요청 5개의 평균. fio는 같은 모델 파일을 읽었다. decode의 평균 I/O 크기는 72~84 KiB라 64 KiB fio와 블록 크기가 정확히 같지는 않다."><NvmeThroughput /></Figure>
+
+같은 프롬프트를 반복해도 decode 속도가 최대 2.1배 달랐다(1.13 → 2.38 tok/s). 서버 측정 18회 전체로는 0.9~2.7 tok/s였다. 편차는 프롬프트보다 회차별 NVMe 처리량과 함께 움직였다.
+
+<Figure caption="I/O 추적을 붙인 요청 8회. 점선은 같은 프롬프트의 두 회차다."><DecodeVsNvme /></Figure>
+
+decode tok/s와 그 구간 NVMe 처리량의 상관계수는 0.90이었다. 다만 처리량이 회차마다 달라지는 원인은 확인하지 못했다. 이후 세션의 측정에서는 같은 설정의 표준편차가 이보다 작았다.
+
+초기 측정에서 본 NVMe 최고치 868 MB/s는 prefill 구간 처리량과 같은 범위다. prefill 구간 처리량은 475~926 MB/s였고, 서버 기동 직후 첫 2회를 빼면 864~926 MB/s(동시 I/O 약 2.3)였다.
+
+## decode 시간의 구성
+
+**계산 스레드 하나가 I/O를 기다린 시간은 15~22%였지만, 하나 이상이 I/O 대기인 시간은 decode의 40~45%였다.**
+
+decode 중 서버 스레드 상태를 5 ms 간격으로 샘플링했다(요청 2회, 각 63토큰). 계산 스레드 6개(main과 worker 5개)는 모두 비슷한 비율로 시간을 썼다.
+
+<Figure caption="/proc의 스레드 상태 샘플. 진한 막대는 스레드 6개 중 최솟값, 옅은 부분은 최댓값까지다."><DecodeThreadTime /></Figure>
+
+별도 5회 측정에서 프로세스 CPU 사용량은 약 2코어분이었고, 그중 31~42%가 커널 시간이었다. 토큰당 major fault는 2,500~4,000건이었다.
+
+대기(S) 시간에는 GPU 쪽 연산(attention, shared expert)을 기다리는 구간과 스레드 간 barrier 대기가 섞여 있다. 이번 측정으로는 둘을 나누지 못했다. 이 분포만 보면 I/O 대기가 decode 시간의 대부분을 차지하지는 않는다. 다만 CPU 계산 스레드는 연산(op)마다 barrier로 동기화되므로, 한 스레드가 fault로 멈추면 나머지도 그 스레드를 기다린다.
+
+## expert 읽기 개선 실험
+
+**다섯 가지 방법 중 같은 조건에서 decode를 일관되게 높인 것은 패치 없이 스레드를 과다 할당한 `-t 12` 하나였다.**
+
+시험한 방법은 스레드 과다 할당, `MADV_WILLNEED`, 병렬 `pread`, 내장 GPU expert 캐시, 비동기 expert 로더다. 패치는 원래 빌드와 분리한 사본에 넣고 환경변수로 켜고 껐다. 측정 세션마다 기준값이 달랐으므로(`-t 6` 2.26~2.60, `-t 12` 2.89~3.06 tok/s) 비교는 같은 세션 안에서만 한다.
+
+서버 측정(프롬프트 5종, decode 구간 I/O만 집계)의 I/O 지표는 다음과 같다.
+
+| 방법 | decode tok/s | NVMe 처리량 | 동시 I/O | 평균 I/O 크기 | 토큰당 NVMe 읽기 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 기준(`-t 6`) | 2.33 ± 0.29 | 485 MB/s | 1.38 | 73.5 KiB | 212 MB |
+| `MADV_WILLNEED`(`-t 6`) | 2.39 ± 0.21 | 423 MB/s | 0.91 | 90.0 KiB | 180 MB |
+| 기준(`-t 6`, 별도 세션) | 2.31 ± 0.30 | 451 MB/s | 1.28 | 71.9 KiB | 200 MB |
+| 스레드 과다 할당(`-t 12`) | 2.94 ± 0.19 | 583 MB/s | 1.67 | 84.2 KiB | 201 MB |
+
+<Figure caption="같은 세션·같은 스레드 수의 패치 없는 기준값 대비 decode 변화. -t 12 행만 기준이 -t 6이다. -t 12, MADV_WILLNEED, GPU 캐시는 서버 측정(요청 5~10회), 나머지는 llama-bench tg64 3회."><ExpertReadExperiments /></Figure>
+
+**스레드 과다 할당.** 코어는 6개지만 계산 스레드를 9~12개로 주면, 일부 스레드가 fault로 멈춘 동안 다른 스레드가 실행되어 동시에 진행되는 fault가 늘어날 것으로 예상했다. `llama-bench` tg64(3회)는 4/6/9/12스레드에서 각각 2.46 / 2.40 / 3.03 / 3.06 tok/s였다. 서버 측정에서 12스레드는 6스레드보다 decode 27%, NVMe 처리량 29%, 동시 I/O 31%, prefill 33% 높았다. 토큰당 NVMe 읽기는 200 MB와 201 MB로 같았다. 다섯 차례 세션에서 `-t 6` 대비 `-t 12`의 decode 개선폭은 +14~34%였다.
+
+**`MADV_WILLNEED`.** llama.cpp의 CPU `mul_mat_id`에서 router가 고른 expert 구간에 `madvise(MADV_WILLNEED)`를 걸었다(2라운드 교차, 각 10회). 평균 I/O 크기는 73.5에서 90.0 KiB로 커지고 토큰당 읽기량은 15% 줄었다. 그러나 동시 I/O도 1.38에서 0.91로 줄었고, decode 속도는 차이가 없었다. 이 패치는 6스레드에서만 측정했다.
+
+**병렬 `pread`.** Flash-MoE의 방식을 llama.cpp 안에서 근사한 패치다. 같은 `mul_mat_id`에서 router가 고른 expert 구간 중 page cache에 없는 페이지를 `mincore`로 찾는다. 그 부분을 모든 계산 스레드가 나눠 `pread`로 page cache에 올린 뒤, barrier를 거쳐 계산한다. 실행 전체(모델 로드와 warm-up 포함)의 NVMe 읽기량은 52~54 GB에서 40~42 GB로 19~25% 줄었다. fd 단위 readahead를 끄지 않으면(`POSIX_FADV_RANDOM` 없음) 회차마다 속도가 크게 흔들렸는데, 그 원인은 확인하지 못했다. readahead를 끈 128 KiB 조건은 6스레드에서 9% 빨라졌지만, 12스레드에서는 6% 느려졌다. chunk를 512 KiB로 키우면 두 경우 모두 느려졌다. 이 패치는 "모두 읽은 뒤 계산"하는 구조라서, page fault 경로에서 겹치던 읽기와 계산이 더 이상 겹치지 않는다. 12스레드에서는 fault끼리 이미 겹쳐 읽히고 있었으므로, 읽기량을 줄인 이득보다 이 직렬화 비용이 컸던 것으로 추정한다. `pread` 중 동시 I/O 수는 측정하지 않았다.
+
+**내장 GPU expert 캐시.** 이 빌드의 `--moe-cache-mib`는 CPU에 둔 expert 중 router가 고른 것을 GPU 캐시로 올려 GPU에서 계산한다. 서버로 측정했다(`-t 12`, 프롬프트 5종). 캐시 512/1024/2048 MiB에서 decode는 1.50 / 1.54 / 1.66 tok/s로, 캐시를 끈 경우(2.89)보다 43~48% 느렸다. 캐시를 켜면 decode 중 동시 I/O가 0.44~0.47개로 떨어지고, 평균 I/O 크기는 83 KiB에서 223~248 KiB로 커졌다. 토큰당 NVMe 읽기도 193 MB에서 267~293 MB로 늘었다. 캐시가 page cache 몫의 메모리를 가져간 영향일 수 있지만, 읽기량이 캐시 크기에 비례하지 않아(512 MiB에서 이미 267 MB) 그것만으로는 설명되지 않는다. CPU와 GPU가 메모리를 공유하는 보드에서는 이 캐시도 page cache와 같은 DRAM을 쓰며, page cache와 달리 회수되지 않는다.
+
+**비동기 expert 로더.** 레이어 안의 expert 연산은 up → gate → down 순서다. up 연산이 시작되면 router가 고른 expert의 gate와 down 구간을 백그라운드 I/O 스레드 큐에 넣는다. I/O 스레드는 up이 계산되는 동안 이 구간을 page cache에 올린다. 텐서 위치는 gguf 헤더에서 찾았고, I/O fd에는 readahead를 껐다. 6스레드에서는 7% 빨라졌지만, 12스레드에서는 I/O 스레드 4/8/16개 모두 차이가 표준편차 안이었다. 읽기량은 5~7% 줄었다. 레이어 하나에 드는 시간이 8~10 ms(2.6~3.1 tok/s, 40레이어)로 짧아서, up 연산 동안 미리 읽을 여유가 크지 않았을 가능성이 있다. 미리 읽은 페이지가 gate 연산 전에 도착했는지는 측정하지 않았다.
+
+**해석.** `-t 12`의 이득은 NVMe 처리량 증가와 같은 폭이었고, 토큰당 읽기량은 그대로였다. 반면 읽기량을 줄이거나 읽기 시점을 앞당긴 방법은 `-t 12`를 넘지 못했다. `MADV_WILLNEED`는 6스레드에서 차이가 없었고, 병렬 `pread`와 비동기 로더는 6스레드에서 7~9% 빨라졌지만 12스레드에서는 이득이 없었다. 두 관찰을 함께 설명하는 원인은 확인하지 못했다. 후보로는 대기(S) 구간인 GPU 대기와 스레드 간 동기화, page fault 처리에 드는 커널 시간, 그리고 각 패치의 구현 방식이 있다. 12스레드에서도 동시 I/O는 1.67개라 장치에는 여유가 남아 있다(fio 64 KiB QD4 778 MB/s, 128 KiB QD8 1,618 MB/s).
+
+## 초기 측정 재검증
+
+**TG는 측정 도구와 생성 길이가 달라도 일치했지만, 초기 측정의 PP는 짧은 프롬프트로 잰 값이라 처리량으로 쓸 수 없었다.**
+
+초기 측정은 `llama-cli`에 짧은 한국어 프롬프트를 넣어 1회 생성한 값이었다. 같은 바이너리와 같은 GGUF로 `llama-bench`를 3회 반복해 다시 측정했다(덴스는 pp512/tg128, MoE는 pp128/tg64, 평균 ± 표준편차).
+
+| 모델 | 실행 방식 | PP: 초기 → 재측정 | TG: 초기 → 재측정 |
+| --- | --- | ---: | ---: |
+| Gemma 4 E2B Q4_K_M | 메모리 상주 | 94.7 → 916 ± 42 | 27.6 → 29.6 ± 0.3 |
+| Gemma 4 E4B Q4_K_M | 메모리 상주 | 74.4 → 534 ± 9 | 14.9 → 15.3 ± 0.0 |
+| Qwen3.5-9B IQ4_XS | 메모리 상주 | 102.3 → 384 ± 9 | 13.4 → 13.6 ± 0.0 |
+| Gemma 4 26B-A4B MXFP4 | NVMe mmap, `--cpu-moe` | 4.0 → 9.7 ± 0.1 | 2.6 → 2.61 ± 0.12 |
+| Qwen3.6-35B-A3B MXFP4 | NVMe mmap, `--cpu-moe` | 2.9~4.4 → 3.0 ± 0.7 | 2.2~2.6 → 2.25 ± 0.67 |
+
+TG 차이는 0.4~7.1%였다. 35B-A3B는 서버 측정에서 회차마다 0.9~2.7 tok/s로 흔들렸으므로 단일 수치로 요약하기 어렵다.
+
+PP는 수십 토큰짜리 프롬프트로 측정한 값이라 E2B 기준 pp512보다 9.7배 낮다. 이 값을 근거로 Qwen3.5-9B를 종합 1위로 본 판단은 속도 기준으로는 성립하지 않는다. pp512 기준으로 Qwen3.5-9B는 덴스 3종 중 가장 느리고(E2B의 0.42배, E4B의 0.72배), TG도 E4B보다 11% 낮다.
+
+**메모리에 들어가는 모델에는 초기 측정의 플래그 조합이 필요 없다.** 덴스 3종을 기본 플래그로 돌려도 TG 차이는 1% 안팎이었다(29.6 / 15.5 / 13.7 tok/s). PP는 E4B가 15%, Qwen3.5-9B가 7% 더 높았다(616 / 412 tok/s). `--load-mode mmap --no-host --no-repack --no-op-offload --cpu-moe`는 메모리보다 큰 MoE 모델에만 쓰면 된다.
+
+**Gemma 4의 추론 서술은 chat template 설정에서 왔다.** Gemma 4 template은 `enable_thinking` 변수에 따라 `<|think|>` 토큰을 넣는다. `llama-server`에서 아무것도 지정하지 않은 결과는 `enable_thinking=true`를 준 결과와 같았다. 즉 기본값에서 thinking이 켜진다. `llama-cli --reasoning-budget 0`으로는 template의 thinking이 꺼지지 않았고, 모델은 추론 과정을 답 본문에 영어로 썼다. `--chat-template-kwargs '{"enable_thinking":false}'`를 주면 서버 프롬프트 5종과 `llama-cli` 모두 추론 없이 답만 냈다. 초기 측정에서 비교한 Gemma 응답은 thinking이 켜진 상태에서 나온 것이다. 실행 스크립트에는 Gemma 세 모델에 이 옵션을 추가했고, 스크립트를 통한 동작은 E2B에서 확인했다.
+
+## 모델 선택 기준
+
+**아래 판단은 이번 측정 범위 안에서만 성립한다.**
+
+- **응답 지연이 우선이면 Gemma 4 E2B**(`enable_thinking=false`): TG 29.6, pp512 916 tok/s.
+- **8GB 안에서 가장 큰 덴스 모델이 필요하면 Qwen3.5-9B**: TG 13.6 tok/s. 토큰당 KV가 32 KiB라 컨텍스트 여유가 가장 작다. 32K는 로드됐지만 fit 검사 메시지가 났고, 128K는 KV 할당에 실패했다.
+- **긴 컨텍스트가 필요하면 E4B도 후보**: 토큰당 KV가 9B의 절반이다. 128K에서 KV 2 GiB가 할당됐지만 fit 검사 메시지가 났다.
+- **26B/35B MoE는 대화형으로 쓰기 어렵다**: 35B-A3B를 NVMe mmap으로 돌린다면 `-t 9~12`로 스레드를 코어 수보다 많이 주는 편이 낫다(`-t 6`의 2.3~2.6 → 2.9~3.1 tok/s). 26B-A4B에는 이 설정을 측정하지 않았다. 실행 스크립트는 35B-A3B에만 `-t 12`를 준다.
+
+아직 확인하지 않은 것은 다음과 같다.
+
+- 35B-A3B decode의 NVMe 처리량이 회차마다 달라지는 원인
+- decode 대기(S) 시간 중 GPU 대기와 스레드 간 동기화의 비중, page fault 처리 시간의 영향
+- fd 단위 readahead가 `pread` 속도를 흔드는 메커니즘
+- 비동기 로더가 미리 읽은 페이지가 gate 연산 전에 도착했는지
+- 9B 32K, E4B 128K에서 긴 입력을 실제로 생성할 수 있는지
+- 양자화 형식별 품질
+- Gemma의 대역폭 효율이 낮은 원인
+
+## 데이터와 범위
+
+**공개 자료는 본문 표와 도표의 집계값이며, 결론은 2026년 10월에 측정한 보드 한 대와 llama.cpp 빌드 하나에 한정된다.**
+
+- [llama-bench 결과(덴스·MoE, 초기 측정 대비)](/data/jetson-orin-nano-sllm-moe-streaming/llama-bench.csv)
+- [대역폭 상한과 효율](/data/jetson-orin-nano-sllm-moe-streaming/bandwidth-bound.csv)
+- [컨텍스트별 KV 메모리](/data/jetson-orin-nano-sllm-moe-streaming/kv-cache.csv)
+- [fio 읽기 처리량](/data/jetson-orin-nano-sllm-moe-streaming/fio-randread.csv)
+- [35B-A3B 서버 요청별 decode 속도와 NVMe 읽기](/data/jetson-orin-nano-sllm-moe-streaming/qwen35-a3b-server-runs.csv)
+- [expert 읽기 실험: 서버 측정](/data/jetson-orin-nano-sllm-moe-streaming/expert-read-server.csv)
+- [expert 읽기 실험: llama-bench](/data/jetson-orin-nano-sllm-moe-streaming/expert-read-llama-bench.csv)
+- [스레드 수별 llama-bench](/data/jetson-orin-nano-sllm-moe-streaming/thread-scaling-llama-bench.csv)
+
+반복 횟수가 적다. llama-bench는 조건당 3회, 서버 측정은 프롬프트 4~5종을 1~2라운드 돌렸다. 35B-A3B는 세션마다 기준값이 달랐다. 실험 패치(`MADV_WILLNEED`, 병렬 `pread`, 비동기 로더)는 원인 분리용 최소 구현이라, 같은 아이디어를 더 잘 구현하면 결과가 달라질 수 있다. 품질은 측정하지 않았다.
+
+### 참고
+
+1. [Performant local MoE CPU inference with GPU acceleration in llama.cpp (HF blog)](https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide), [MoE Hybrid GPU and CPU Offloading with llama.cpp](https://llmhardware.io/guides/moe-hybrid-gpu-cpu-offloading-guide), [llama-server man page](https://dyn.manpages.debian.org/unstable/llama.cpp-tools/llama-server.1)
+2. [danveloper/flash-moe 소개](https://daily.dev/posts/github---danveloper-flash-moe-running-a-big-model-on-a-small-laptop-xsgaeefuf), [Simon Willison](https://simonwillison.net/2026/Mar/18/llm-in-a-flash/), [Anemll/flash-moe](https://github.com/Anemll/flash-moe)
+3. [Gemma core docs](https://ai.google.dev/gemma/docs/core), [AI Engineer: Gemma 4 deep dive](https://ai.engineer/talks/gemma-4-deep-dive-cassidy-hardin-google-deepmind)
+4. [Qwen 3.5 Small Models (InsiderLLM)](https://insiderllm.com/guides/qwen-3-5-small-models-9b-beats-30b/), [Trilogy AI deep dive](https://trilogyai.substack.com/p/deep-dive-qwen-35-brings-native-multimodality)
+5. vLLM 소스 `vllm/config/offload.py`, `vllm/model_executor/offloader/uva.py`(커밋 7a64fb8 기준)
+6. [LLM in a flash, arXiv 2312.11514](https://arxiv.org/abs/2312.11514v1)
+7. [llama.cpp completion README 미러](https://gitcode.com/SparkLLM/llama.cpp/blob/master/tools/completion/README.md)

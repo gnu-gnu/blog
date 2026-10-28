@@ -1,0 +1,6 @@
+pattern,block,queue_depth,MBps
+randread,64K,1,200
+randread,64K,2,465
+randread,64K,4,778
+randread,128K,8,1618
+sequential read,1M,,2515

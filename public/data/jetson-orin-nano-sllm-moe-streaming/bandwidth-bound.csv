@@ -1,0 +1,4 @@
+model,cuda0_buffer_mib,measured_gpu_read_GBps,tg_bound_tok_s,tg128_tok_s,efficiency_pct
+Gemma 4 E2B,1407.73,81.4,55.1,29.57,53.6
+Gemma 4 E4B,2883.51,81.4,26.9,15.34,57.0
+Qwen3.5-9B,4373.13,81.4,17.8,13.63,76.8

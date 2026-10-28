@@ -1,0 +1,10 @@
+model,context,kv_full_attn_mib,fixed_mib,fixed_kind,result
+Gemma 4 E2B,4096,24,12,SWA,ok
+Gemma 4 E2B,32768,192,12,SWA,ok
+Gemma 4 E2B,131072,768,12,SWA,ok
+Gemma 4 E4B,4096,64,40,SWA,ok
+Gemma 4 E4B,32768,512,40,SWA,ok
+Gemma 4 E4B,131072,2048,40,SWA,loaded; fit-check message
+Qwen3.5-9B,4096,128,50.25,recurrent state,ok
+Qwen3.5-9B,32768,1024,50.25,recurrent state,loaded; fit-check message
+Qwen3.5-9B,131072,4096,50.25,recurrent state,CUDA0 KV allocation failed

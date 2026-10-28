@@ -1,0 +1,9 @@
+session,method,threads,decode_tok_s,sd,decode_nvme_MBps,mean_inflight,avg_io_kib,nvme_MB_per_token,prefill_tok_s,n_requests
+A,baseline,6,2.33,0.29,485,1.38,73.5,212,2.96,10
+A,MADV_WILLNEED,6,2.39,0.21,423,0.91,90.0,180,3.4,10
+B,baseline,6,2.31,0.3,451,1.28,71.9,200,3.13,5
+B,baseline,12,2.94,0.19,583,1.67,84.2,201,4.17,5
+C,baseline,12,2.89,0.2,548,1.53,83.4,193,4.14,5
+C,moe-cache-mib 512,12,1.5,0.09,396,0.44,223.2,267,2.35,5
+C,moe-cache-mib 1024,12,1.54,0.17,443,0.45,243.6,293,2.31,5
+C,moe-cache-mib 2048,12,1.66,0.18,463,0.47,247.6,285,2.23,5

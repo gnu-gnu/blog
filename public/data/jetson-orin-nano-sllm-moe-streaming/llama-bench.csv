@@ -1,0 +1,16 @@
+model,quant,flags,test,tok_s,sd,initial_measurement_tok_s
+Gemma 4 E2B,Q4_K_M,initial,pp512,916.45,41.67,94.7
+Gemma 4 E2B,Q4_K_M,initial,tg128,29.57,0.31,27.6
+Gemma 4 E2B,Q4_K_M,default,tg128,29.63,0.79,
+Gemma 4 E4B,Q4_K_M,initial,pp512,533.96,9.49,74.4
+Gemma 4 E4B,Q4_K_M,initial,tg128,15.34,0.03,14.9
+Gemma 4 E4B,Q4_K_M,default,pp512,616.02,4.93,
+Gemma 4 E4B,Q4_K_M,default,tg128,15.49,0.02,
+Qwen3.5-9B,IQ4_XS,initial,pp512,384.3,8.7,102.3
+Qwen3.5-9B,IQ4_XS,initial,tg128,13.63,0.03,13.4
+Qwen3.5-9B,IQ4_XS,default,pp512,412.21,1.43,
+Qwen3.5-9B,IQ4_XS,default,tg128,13.69,0.19,
+Gemma 4 26B-A4B,MXFP4_MOE,initial+cpu-moe,pp128,9.69,0.1,4.0
+Gemma 4 26B-A4B,MXFP4_MOE,initial+cpu-moe,tg64,2.61,0.12,2.6
+Qwen3.6-35B-A3B,MXFP4_MOE,initial+cpu-moe,pp128,2.97,0.71,2.9-4.4
+Qwen3.6-35B-A3B,MXFP4_MOE,initial+cpu-moe,tg64,2.25,0.67,2.2-2.6
