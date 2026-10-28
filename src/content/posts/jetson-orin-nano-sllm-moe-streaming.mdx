@@ -1,6 +1,6 @@
 ---
 title: "8GB Jetson Orin Nano에서 메모리보다 큰 MoE를 SSD로 스트리밍하기"
-description: "8GB 기기에서 sLLM 구동의 한계를 늘려 보기 위해, Jetson Orin Nano에서 메모리보다 큰 MoE 모델을 SSD 스트리밍으로 돌려 봤다."
+description: "8GB급 엣지 기기에서 메모리보다 큰 모델을 돌리는 방법으로 SSD 스트리밍이 주목받고 있다. Jetson Orin Nano Super에서 메모리의 2.7배인 Qwen3.6-35B-A3B를 llama.cpp mmap 스트리밍으로 돌려 보며, 이 방식이 실제로 어디까지 쓸 만하고 속도가 어디서 막히는지 확인했다."
 date: 2026-10-28
 updated: 2026-10-28
 category: "AI 인프라"
@@ -15,6 +15,18 @@ import NvmeThroughput from '../../components/diagrams/NvmeThroughput.jsx';
 import DecodeVsNvme from '../../components/diagrams/DecodeVsNvme.jsx';
 import DecodeThreadTime from '../../components/diagrams/DecodeThreadTime.jsx';
 import ExpertReadExperiments from '../../components/diagrams/ExpertReadExperiments.jsx';
+
+**TL;DR** — Jetson Orin Nano Super 8GB(MAXN_SUPER)에서 측정한 sLLM 속도
+
+| 모델 | 파일 크기 | 실행 방식 | decode (tok/s) | prefill (tok/s) |
+| --- | ---: | --- | ---: | ---: |
+| Gemma 4 E2B Q4_K_M | 2.9 GiB | 메모리 상주 | 29.6 | 916 |
+| Gemma 4 E4B Q4_K_M | 4.6 GiB | 메모리 상주 | 15.3 | 534 |
+| Qwen3.5-9B IQ4_XS | 4.8 GiB | 메모리 상주 | 13.6 | 384 |
+| Gemma 4 26B-A4B MXFP4 | 15.4 GiB | SSD 스트리밍(mmap) | 2.6 | 9.7 |
+| Qwen3.6-35B-A3B MXFP4 | 20.2 GiB | SSD 스트리밍(mmap) | 2.3\~2.6 (`-t 6`)<br/>2.9\~3.1 (`-t 12`) | 3.0 |
+
+llama-bench 3회 평균. 덴스는 pp512/tg128, MoE는 pp128/tg64이며, 35B-A3B decode는 측정 세션별 범위다.
 
 모든 추론을 클라우드에 맡길 수는 없다. 네트워크 왕복 없이 응답해야 하는 기기, 데이터를 밖으로 보낼 수 없는 현장, 연결이 끊길 수 있는 환경에서는 모델이 기기 안에서 돌아야 한다. 그런 기기의 메모리는 몇 GB이고, 거기에 들어가는 sLLM은 큰 모델보다 능력이 떨어진다.
 
