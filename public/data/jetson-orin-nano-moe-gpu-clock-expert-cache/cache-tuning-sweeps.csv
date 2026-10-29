@@ -1,6 +1,10 @@
 sweep,config,requests,decode_tok_s_mean
 reference,GPU floor only (first 4 requests of gpu1020),4,3.61
-cache_read,"synchronous cache, -t 6",4,3.75
+first_cache,"read whole units then compute, -t 12 (first 4 of 12 requests)",4,3.207
+first_cache,"read in 128 KiB chunks then compute, -t 12",4,3.538
+first_cache,"read in 256 KiB chunks then compute, -t 12",4,3.424
+first_cache,"read in 128 KiB chunks then compute, -t 8",4,3.556
+first_cache,"read in 128 KiB chunks then compute, -t 6",4,3.75
 io_threads,"overlap, IO 2, -t 6",4,3.429
 io_threads,"overlap, IO 3, -t 6",4,4.208
 io_threads,"overlap, IO 4, -t 6",4,4.367
