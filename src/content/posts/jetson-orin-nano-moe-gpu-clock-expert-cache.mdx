@@ -1,6 +1,6 @@
 ---
 title: "SSD로 스트리밍하는 MoE는 왜 느렸을까: 8GB Jetson Orin Nano 2부"
-description: "1부에서 메모리의 2.7배인 Qwen3.6-35B-A3B를 SSD 스트리밍으로 돌렸지만, decode는 3 tok/s 안팎에서 멈췄고 원인은 찾지 못했습니다. 2부에서는 1부의 측정 방식을 바로잡고 decode 시간을 나눠 원인을 추적한 뒤, GPU 클럭 하한과 사용자 공간 expert 캐시, 다음 층 expert 예측을 차례로 시험했습니다. 같은 설정을 다른 모델 다섯 종에도 적용해 이 개선이 어떤 조건에서만 통하는지 확인했습니다."
+description: "1부에서 메모리의 2.7배인 Qwen3.6-35B-A3B를 SSD 스트리밍으로 돌렸을 때 decode가 3 tok/s 안팎에 머문 데는 두 가지 병목이 있었습니다. 첫째, CPU가 expert를 계산하는 동안 GPU가 쉬는 탓에 governor가 GPU를 최저 클럭(306 MHz)에 묶어 두었습니다. 둘째, expert 가중치를 page fault로 읽는 동안 계산 스레드가 멈춰 SSD를 동시 I/O 1~2개로만 쓰고 있었습니다. 2부에서는 두 병목을 GPU 클럭 하한과 사용자 공간 expert 캐시로 풀어 가는 과정과, 이 방법이 통하지 않는 조건을 정리했습니다."
 date: 2026-10-29
 updated: 2026-10-29
 category: "AI 인프라"
@@ -17,7 +17,12 @@ import ExpertCachePipeline from '../../components/diagrams/ExpertCachePipeline.j
 import StepPromptSpread from '../../components/diagrams/StepPromptSpread.jsx';
 import ModelControls from '../../components/diagrams/ModelControls.jsx';
 
-**TL;DR** — Qwen3.6-35B-A3B(MXFP4, 20 GiB)를 Jetson Orin Nano Super 8GB에서 SSD 스트리밍으로 돌릴 때의 단계별 속도입니다.
+**왜 느렸나** — 병목은 두 가지였습니다.
+
+- **GPU 클럭**: CPU가 expert를 계산하는 동안 GPU가 쉬어 사용률이 36%로 보이자, governor가 decode 내내 GPU를 최저 306 MHz에 두었습니다. 토큰마다 반드시 지나는 GPU 구간이 그만큼 길어졌습니다.
+- **읽기 경로**: expert 가중치를 page fault로 읽는 동안 계산 스레드가 멈추고, 나머지 스레드도 동기화 지점에서 기다렸습니다. SSD는 동시 I/O 1\~2개로만 쓰였습니다.
+
+**TL;DR** — 두 병목을 차례로 풀었을 때의 단계별 속도입니다. Qwen3.6-35B-A3B(MXFP4, 20 GiB)를 Jetson Orin Nano Super 8GB에서 SSD 스트리밍으로 돌렸습니다.
 
 | 단계 | 바꾼 것 | decode (tok/s) | ① 대비 | prefill | NVMe 읽기 |
 | --- | --- | ---: | ---: | ---: | ---: |
