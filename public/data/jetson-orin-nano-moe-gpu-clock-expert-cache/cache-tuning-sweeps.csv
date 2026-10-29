@@ -1,0 +1,14 @@
+sweep,config,requests,decode_tok_s_mean
+reference,GPU floor only (first 4 requests of gpu1020),4,3.61
+cache_read,"synchronous cache, -t 6",4,3.75
+io_threads,"overlap, IO 2, -t 6",4,3.429
+io_threads,"overlap, IO 3, -t 6",4,4.208
+io_threads,"overlap, IO 4, -t 6",4,4.367
+io_threads,"overlap, IO 6, -t 6",4,3.707
+io_threads,"overlap, IO 8, -t 6",4,3.798
+order,"gate-first queue, IO 4, -t 6",4,4.637
+compute_threads,"gate-first, IO 4, -t 5",4,4.764
+compute_threads,"gate-first, IO 4, -t 4",4,4.957
+compute_threads,"gate-first, IO 4, -t 3",4,4.846
+compute_threads_12req,"gate-first, IO 4, -t 5",12,4.814
+compute_threads_12req,"gate-first, IO 4, -t 4",12,4.961

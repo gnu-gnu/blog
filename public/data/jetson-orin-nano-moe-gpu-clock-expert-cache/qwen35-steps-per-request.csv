@@ -1,0 +1,49 @@
+step,config,request,prompt_tokens,prefill_ms,generated_tokens,decode_tok_s,nvme_read_mib,same_text_as_step2
+1_default,"-t 12, no GPU floor",0,30,7109,256,3.12,48828,True
+1_default,"-t 12, no GPU floor",1,21,5719,256,2.814,65636,True
+1_default,"-t 12, no GPU floor",2,32,6350,256,2.709,65588,True
+1_default,"-t 12, no GPU floor",3,22,6290,256,2.81,64682,True
+1_default,"-t 12, no GPU floor",4,25,6224,256,3.102,48735,True
+1_default,"-t 12, no GPU floor",5,26,6911,131,2.726,41506,True
+1_default,"-t 12, no GPU floor",6,33,7180,256,2.843,66558,True
+1_default,"-t 12, no GPU floor",7,22,6494,256,2.4,82490,True
+1_default,"-t 12, no GPU floor",8,28,6945,256,2.68,70893,True
+1_default,"-t 12, no GPU floor",9,24,7182,256,2.408,89789,True
+1_default,"-t 12, no GPU floor",10,27,6790,256,2.914,63244,True
+1_default,"-t 12, no GPU floor",11,28,7626,256,2.232,95343,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",0,30,7106,256,4.146,48382,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",1,21,5753,256,3.487,65572,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",2,32,6332,256,3.38,64911,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",3,22,6296,256,3.426,64195,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",4,25,6176,256,3.532,48438,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",5,26,6802,131,3.361,41213,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",6,33,7020,256,3.317,66149,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",7,22,6422,256,3.083,82052,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",8,28,6880,256,3.441,70313,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",9,24,7071,256,2.805,89595,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",10,27,6704,256,3.64,63129,True
+2_gpu_floor,"GPU min 1020 MHz, -t 12",11,28,7742,256,2.86,95375,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",0,30,3867,256,4.875,44225,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",1,21,3129,256,4.178,57162,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",2,32,3326,256,4.389,55046,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",3,22,3214,256,4.429,52425,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",4,25,3100,256,5.004,40952,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",5,26,3499,131,4.276,30914,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",6,33,3538,256,4.219,48494,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",7,22,3158,256,3.953,57790,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",8,28,3370,256,4.602,49117,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",9,24,3339,256,3.986,59610,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",10,27,3317,256,4.526,41552,True
+3_expert_cache,"floor + 2 GiB cache, IO 4, -t 6",11,28,4015,256,4.21,59694,True
+4_order_threads,"3 + gate-first queue, -t 4",0,30,4331,256,5.317,44207,True
+4_order_threads,"3 + gate-first queue, -t 4",1,21,3480,256,4.697,57166,True
+4_order_threads,"3 + gate-first queue, -t 4",2,32,3318,256,4.783,55061,True
+4_order_threads,"3 + gate-first queue, -t 4",3,22,3178,256,4.921,52418,True
+4_order_threads,"3 + gate-first queue, -t 4",4,25,3218,256,5.38,40938,True
+4_order_threads,"3 + gate-first queue, -t 4",5,26,3404,131,4.796,30899,True
+4_order_threads,"3 + gate-first queue, -t 4",6,33,3487,256,5.105,48489,True
+4_order_threads,"3 + gate-first queue, -t 4",7,22,3177,256,4.709,57788,True
+4_order_threads,"3 + gate-first queue, -t 4",8,28,3340,256,5.069,49108,True
+4_order_threads,"3 + gate-first queue, -t 4",9,24,3521,256,4.66,59608,True
+4_order_threads,"3 + gate-first queue, -t 4",10,27,3488,256,5.391,41564,True
+4_order_threads,"3 + gate-first queue, -t 4",11,28,3944,256,4.703,59712,True

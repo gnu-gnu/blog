@@ -1,0 +1,197 @@
+---
+title: "8GB Jetson Orin Nano MoE 스트리밍 2부: GPU 클럭과 expert 캐시"
+description: "1부에서 메모리의 2.7배인 Qwen3.6-35B-A3B를 SSD 스트리밍으로 돌렸지만, decode는 3 tok/s 안팎에서 멈췄고 무엇이 막는지는 남겨 두었다. 2부에서는 1부의 측정 방식을 바로잡은 뒤 막는 원인을 찾아 GPU 클럭 하한, 사용자 공간 expert 캐시, 다음 층 expert 예측을 차례로 시험했다. 같은 설정을 dense·MoE 모델 다섯 종에도 적용해, 이 개선이 어떤 조건에서만 통하는지 확인했다."
+date: 2026-10-29
+category: "AI 인프라"
+tags: ["llama.cpp", "Jetson", "MoE", "NVMe", "O_DIRECT", "expert 캐시", "DVFS", "eBPF", "Qwen", "gpt-oss"]
+draft: false
+---
+
+import Figure from '../../components/Figure.astro';
+import DecodeFixedCost from '../../components/diagrams/DecodeFixedCost.jsx';
+import CacheSizeSim from '../../components/diagrams/CacheSizeSim.jsx';
+import ExpertCachePipeline from '../../components/diagrams/ExpertCachePipeline.jsx';
+import StepPromptSpread from '../../components/diagrams/StepPromptSpread.jsx';
+import ModelControls from '../../components/diagrams/ModelControls.jsx';
+
+**TL;DR** — Qwen3.6-35B-A3B(MXFP4, 20 GiB)를 Jetson Orin Nano Super 8GB에서 SSD 스트리밍으로 돌릴 때의 단계별 속도
+
+| 단계 | 바꾼 것 | decode (tok/s) | ① 대비 | prefill | NVMe 읽기 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| ① 기본 | mmap 스트리밍, `--cpu-moe`, `-t 12` | 2.73 | ×1.00 | 6.7 s | 784 GiB |
+| ② GPU 하한 | GPU 최저 클럭을 1020 MHz로 | 3.37 | ×1.24 | 6.7 s | 781 GiB |
+| ③ expert 캐시 | ② + 2 GiB LRU 캐시, O_DIRECT, 읽기·계산 겹치기, `-t 6` | 4.39 | ×1.61 | 3.4 s | 583 GiB |
+| ④ 순서·스레드 | ③ + gate 먼저 읽기, `-t 4` | 4.96 | ×1.82 | 3.5 s | 583 GiB |
+
+실제 프롬프트 12개를 서버에 보내 256토큰씩 greedy로 생성한 평균이다. NVMe 읽기는 12요청 합계다. 네 단계 모두 생성 문장이 12개 다 같았고, wikitext-2 perplexity는 캐시 유무와 관계없이 6.2344였다. 같은 설정을 메모리에 들어가는 모델에 적용하면 효과가 없었고, gpt-oss-20b에서는 캐시가 오히려 느렸다.
+
+[1부](/posts/jetson-orin-nano-sllm-moe-streaming/)에서는 OS가 보는 메모리가 7.4 GiB인 Jetson Orin Nano Super에서 20 GiB짜리 Qwen3.6-35B-A3B를 llama.cpp mmap 스트리밍으로 돌렸다. decode는 1\~3 tok/s였고 NVMe는 동시 I/O 1\~2개 수준으로만 쓰였다. 읽기 방식을 바꾼 패치는 계산 스레드를 코어보다 많이 준 `-t 12`를 넘지 못했고, 무엇이 decode를 막는지는 확인하지 못한 채 끝났다.
+
+2부는 그 질문에서 출발한다. 먼저 1부의 측정에서 잘못된 부분 세 가지를 바로잡았다. 그다음 decode 시간을 NVMe 읽기에 비례하는 부분과 고정된 부분으로 나눴다. 고정 부분에서는 GPU 클럭 문제를, 비례 부분에서는 page cache의 한계를 찾았다. 각각 GPU 클럭 하한과 사용자 공간 expert 캐시로 대응했고, 1부 끝에서 예고한 다음 층 expert 예측(prerouter)도 구현해 시험했다. 끝으로 같은 설정을 다른 모델 다섯 종에 적용해, 효과가 어떤 조건에서만 나는지 확인했다.
+
+## 1부 측정의 정정
+
+**1부의 MoE 수치는 무작위 토큰으로 정한 라우팅과 최저 클럭에 묶인 GPU에서 잰 값이었고, expert 연산 순서도 잘못 적었다.**
+
+**llama-bench의 tg는 MoE 라우팅을 대표하지 못한다.** llama-bench는 decode 입력 토큰을 `std::rand() % n_vocab`로 만든다. dense 모델에서는 문제가 되지 않지만, MoE는 토큰에 따라 고르는 expert가 달라진다. 무작위 토큰열의 라우팅은 실제 문장의 라우팅과 다르고, 그만큼 expert 재사용과 page cache 적중도 달라진다. 2부의 수치는 모두 실제 프롬프트 12개(한국어 6개, 영어 6개, 21\~33토큰)를 llama-server에 보내 256토큰씩 생성한 값이다. 1부 TL;DR의 35B-A3B decode와 llama-bench로 잰 실험 결과는 2부 수치와 직접 비교하지 않는다. 1부와 같은 조건(`-t 12`, 클럭 기본값)을 실제 프롬프트로 잰 기준값은 2.73 tok/s(요청별 2.23\~3.12)다.
+
+**decode 중 GPU는 최저 클럭이었다.** 1부는 CPU와 GPU에 동시에 부하를 주는 시험에서 GPU가 1020 MHz를 유지하는 것만 확인했고, MoE decode 중의 클럭은 보지 않았다. 다시 재 보니 측정 구간의 GPU 클럭 샘플 7,773개 중 7,736개(99.5%)가 최저인 306 MHz였다. 1부의 MoE 수치는 모두 이 상태에서 잰 값이다. 원인과 대응은 아래 GPU 클럭 절에서 다룬다.
+
+**expert 연산 순서는 up → gate → down이 아니라 gate → up → down이다.** 1부는 본문과 경로 도표에서 up → gate → down 순서로 적었고, 비동기 로더도 이 전제로 만들었다. up 연산이 시작될 때 gate와 down을 미리 읽게 한 것이다. llama.cpp는 그래프를 만들 때 up을 먼저 만들지만, ggml은 실행 노드를 SwiGLU(gate, up)의 입력 순서로 정렬해 gate를 먼저 실행한다. 캐시 적중 통계가 예상과 다르게 나와 이 순서를 확인했다. 따라서 1부의 비동기 로더가 미리 읽게 한 gate는 이미 계산이 끝난 뒤였고, 실제로 앞당겨진 것은 down뿐이었다. 1부에서 이 로더가 효과를 내지 못한 이유 중 하나일 수 있지만, 고친 로더로 다시 재지는 않았다.
+
+## decode 시간의 고정 부분
+
+**요청별 decode 시간은 토큰당 약 193 ms의 고정 부분과 NVMe 읽기 1 MiB당 0.64 ms로 나뉘었다.**
+
+토큰당 읽는 바이트를 바꿔 보려고 같은 프롬프트 12개를 top-k 8(기본)과 top-k 4로 돌렸다. top-k 4는 GGUF의 `expert_used_count`를 덮어써 토큰당 expert를 절반만 쓰게 한 것이다. 요청마다 NVMe 읽기량을 생성 토큰 수로 나눈 값과 토큰당 decode 시간을 놓으면, 두 설정의 점 24개가 한 직선에 놓인다.
+
+<Figure caption="Qwen3.6-35B-A3B, -t 12, GPU 클럭 기본값. 가로축은 prefill을 포함한 요청 전체 NVMe 읽기를 생성 토큰 수로 나눈 값이다. 점선은 24개 점의 최소제곱 직선."><DecodeFixedCost /></Figure>
+
+직선의 기울기는 NVMe에서 1 MiB를 더 읽을 때 늘어나는 시간이다. 절편 193 ms는 읽기가 없어도 남는 시간이다. 이 조건에서는 NVMe 읽기를 모두 없애도 decode가 5.2 tok/s를 넘을 수 없다. 고정 부분에는 GPU의 attention과 shared expert 계산, CPU의 expert 계산, 그리고 둘 사이의 동기화가 들어 있다. top-k 4는 읽기를 줄여 decode가 3.89 tok/s까지 올랐지만, wikitext-2 perplexity가 6.23에서 7.58로 21.5% 나빠져 채택하지 않았다. top-k 6은 6.52(+4.5%)였다.
+
+1부에서 남긴 두 질문, 즉 NVMe를 더 잘 쓰는 문제와 그 밖의 대기 시간 문제는 이 직선의 기울기와 절편에 각각 대응한다. 절편부터 봤다.
+
+## GPU 클럭: governor가 본 27%
+
+**`--cpu-moe`에서는 GPU가 토큰마다 잠깐씩만 일해서 governor가 클럭을 최저로 뒀다. 최저 클럭을 1020 MHz로 올린 것만으로 decode가 1.24배가 됐다.**
+
+Jetson의 GPU 클럭은 `nvhost_podgov` governor가 최근 구간의 GPU 사용률을 보고 정한다. `--cpu-moe`로 돌리면 토큰 하나를 만드는 동안 GPU(attention, shared expert, router)와 CPU(routed expert)가 40개 레이어에 걸쳐 번갈아 일한다. GPU가 쉬는 동안 CPU가 일하므로 GPU 사용률은 평균 26.8%로 낮게 보였고, governor는 클럭을 306 MHz에 두었다.
+
+하지만 GPU 구간은 토큰마다 반드시 지나는 임계 경로에 있다. GPU 구간이 느려지면 CPU가 그만큼 기다리므로, 사용률이 낮아도 GPU 클럭은 토큰당 시간에 그대로 반영된다. devfreq의 `min_freq`만 1020 MHz로 올리자 decode가 2.73에서 3.37 tok/s로 1.24배가 됐다. 12요청 모두 빨라졌고 생성 문장은 같았다.
+
+| 설정 | 측정 구간 클럭 분포 | GPU 사용률 평균 | 보드 입력 전력 평균 | decode (tok/s) |
+| --- | --- | ---: | ---: | ---: |
+| governor 기본값 | 306 MHz 99.5% | 26.8% | 7.7 W | 2.60 (2요청) |
+| 최저 클럭 1020 MHz | 1020 MHz 100% | 17.6% | 9.6 W | 3.37 (12요청) |
+
+전력은 tegrastats의 `VDD_IN`을 측정 구간 전체로 평균한 값이다. 하한을 걸면 평균 전력은 25% 늘지만 decode가 빨라져, 생성 토큰당 에너지는 대략 3.4 J에서 3.0 J로 늘지 않았다. 기본값 쪽은 2요청이고 prefill 구간도 섞여 있어 대략치다.
+
+`jetson_clocks`로 CPU, GPU, 메모리 클럭을 모두 최대로 고정하는 방법도 시험했다. 두 차례 12요청 평균은 3.29와 3.63 tok/s로 하한만 건 경우와 비슷했지만, 요청별 범위가 1.92\~4.71, 2.73\~5.11 tok/s로 크게 흔들렸다. 원인은 확인하지 못했다. 그래서 GPU 최저 클럭만 올리는 쪽을 택했다.
+
+하한을 항상 걸어 두지 않기 위해, MoE 오프로드 프로세스가 llama.cpp를 호출하는 동안에만 하한을 거는 서비스를 만들었다. bpftrace uprobe로 `libllama`의 `llama_decode`, `llama_process`, `llama_synchronize` 진입과 반환을 감시한다. 명령줄에 `--cpu-moe`나 `--n-cpu-moe`가 있는 프로세스만 센다. 마지막 반환 뒤 1초가 지나면 하한을 내리고, devfreq의 `min_freq` 외에는 건드리지 않는다. [jetson-moe-gpu-stabilizer](https://github.com/gnu-gnu/jetson-moe-gpu-stabilizer)로 공개했다.
+
+## page cache 대신 expert 캐시
+
+**page cache는 무엇을 언제 얼마나 읽을지 커널이 정해서 동시 I/O가 1\~2개에 머물렀다. expert 단위 LRU 캐시를 O_DIRECT로 채우고 읽기와 계산을 겹치자, decode가 하한만 건 경우보다 1.30배, 순서와 스레드를 조정한 뒤에는 1.47배가 됐다.**
+
+### 무엇을 캐시할까
+
+캐시 정책은 1부와 같은 프롬프트 12개의 router 출력(레이어별로 고른 expert 번호)을 기록해 시뮬레이션으로 골랐다. 캐시 단위는 레이어 하나의 expert 하나, 즉 그 expert의 up·gate·down 가중치 묶음이다. 크기는 레이어에 따라 1.75\~2.20 MiB이고, 40개 레이어 × 256개로 10,240개다. 비교한 정책은 둘이다. LRU, 그리고 앞 요청 6개에서 자주 쓰인 expert를 캐시 크기만큼 고정해 두는 배치다. 평가는 뒤 요청 6개의 decode로 했다.
+
+<Figure caption="요청 12개의 router 기록으로 계산한 decode 토큰당 NVMe 읽기. 고정 배치는 앞 6개 요청의 빈도로 고르고 뒤 6개로 평가했으며, LRU도 같은 6개로 평가했다."><CacheSizeSim /></Figure>
+
+같은 크기에서 LRU가 고정 배치보다 훨씬 적게 읽었다. 2 GiB에서 LRU는 토큰당 186 MiB, 고정 배치는 376 MiB였다. 프롬프트마다 쓰는 expert가 달라서, 전체 빈도보다 최근에 쓴 expert가 다음 토큰에서 다시 쓰일 가능성이 더 높았다. 0.5 GiB에서 LRU가 전혀 효과가 없는 것은 토큰 하나가 40개 레이어에서 읽는 expert(약 567 MiB)보다 캐시가 작아, 다시 쓰기 전에 밀려나기 때문이다. 크기는 2 GiB로 정했다. 3 GiB는 이 보드에 남는 메모리로는 서버를 안정적으로 유지하지 못했다.
+
+### 구현
+
+<Figure caption="CPU의 mul_mat_id 안에 넣은 캐시. 조회와 슬롯 교체는 계산 스레드 0이 하고, 읽기는 전용 I/O 스레드가 한다."><ExpertCachePipeline /></Figure>
+
+llama.cpp CPU 백엔드의 `mul_mat_id`(expert 행렬곱)에 환경변수로 켜는 패치를 넣었다.
+
+- **슬롯과 교체**: 2 GiB를 단위 크기별 슬롯 1,150개로 나눈다(전체 단위의 11%). 계산 스레드 0이 고른 expert를 찾고, 없으면 가장 오래 쓰이지 않은 슬롯을 비운다.
+- **읽기**: 비운 슬롯에 넣을 바이트를 128 KiB 조각으로 나눠 큐에 넣는다. 전용 I/O 스레드 4개가 O_DIRECT `pread`로 읽는다. O_DIRECT는 page cache를 거치지 않으므로 같은 바이트가 캐시와 page cache에 두 번 올라가지 않고, 동시 I/O 수도 커널의 readahead가 아니라 I/O 스레드 수가 정한다.
+- **겹치기**: 슬롯과 가중치 종류마다 남은 조각 수를 원자적 카운터로 둔다. 계산 스레드는 캐시에 있던 expert를 먼저 계산한다. 늦게 온 expert는 자기가 맡은 조각이 도착했는지만 확인하고 계산한다. 레이어 전체의 읽기가 끝나기를 기다리지 않는다.
+- **순서**: 미스가 나면 up·gate·down 세 종류를 모두 큐에 넣되, 지금 계산할 종류를 먼저 넣는다. 처음에는 up을 먼저 넣었는데, 앞에서 말한 대로 실제로는 gate가 먼저 실행된다. 순서를 고치자 decode가 6% 빨라졌다.
+- **prefill**: prefill의 expert 호출도 같은 경로를 탄다. 병렬 O_DIRECT 읽기 덕분에 prefill이 6.7초에서 3.4초로 줄었다.
+
+정확성은 두 가지로 확인했다. 실제 프롬프트 12개의 생성 문장이 캐시 없는 실행과 글자 단위로 같아야 하고, wikitext-2 perplexity(512토큰 8청크)가 같아야 한다. 처음 구현은 문장이 회차마다 무작위로 달라졌다. 원인은 경쟁 조건이었다. 계산 순서를 정할 때 expert마다 "읽기 완료" 여부를 두 번 확인했는데, 그 사이에 읽기가 끝난 expert는 두 목록 어디에도 들어가지 않아 계산에서 빠졌다. 완료 여부를 한 번만 읽도록 고친 뒤로는 모든 실행에서 문장이 같다.
+
+### 조정과 결과
+
+| 조정 (프롬프트 4개, ② 기준 3.61 tok/s) | decode (tok/s) |
+| --- | --- |
+| 계산 스레드가 직접 읽고 계산(겹치기 없음), `-t 6` | 3.75 |
+| I/O 스레드 2 / 3 / **4** / 6 / 8, `-t 6` | 3.43 / 4.21 / **4.37** / 3.71 / 3.80 |
+| + gate 먼저 읽기, `-t 6` | 4.64 |
+| 계산 스레드 `-t 5` / **`-t 4`** / `-t 3` | 4.76 / **4.96** / 4.85 |
+
+읽기와 계산을 겹치지 않으면 하한만 건 경우보다 4% 빠른 데 그쳤다. 겹치자 21%가 됐다. I/O 스레드는 4개가 가장 좋았다. 6개부터 다시 느려진 것은 코어 6개를 계산 스레드와 나눠 쓰기 때문으로 보인다.
+
+계산 스레드는 적을수록 빨라지다가 3개에서 다시 느려졌다. 1부의 page cache 경로에서는 `-t 12`처럼 스레드를 코어보다 많이 주는 쪽이 빨랐다. 반대가 된 이유는 다음과 같이 추정한다. page cache 경로에서는 fault로 멈춘 스레드가 많아야 동시 I/O가 늘었다. 캐시 경로에서는 읽기를 I/O 스레드가 맡으므로, 남는 코어가 I/O 스레드와 읽기 완료 처리에 쓰이는 편이 낫다. 다만 계산 스레드가 3개면 계산 자체가 모자란다.
+
+<Figure caption="같은 프롬프트 12개의 decode 속도. 점선은 ②에서 가장 빠른 요청이다."><StepPromptSpread /></Figure>
+
+12요청으로 다시 재면 `-t 5`가 4.81, `-t 4`가 4.96 tok/s다. 요청별로 봐도 ④의 가장 느린 요청(4.66)이 ②의 가장 빠른 요청(4.15)보다 빠르다. NVMe 읽기는 12요청 합계 781 GiB에서 583 GiB로 25% 줄었다.
+
+## 다음 층 expert 예측(prerouter)
+
+**다음 층의 expert를 80% 맞혔고 읽기 대기 시간도 줄었지만, 코어 6개에서는 추가 읽기와 예측 계산 비용이 이득보다 컸다.**
+
+1부에서 소개한 Edge0의 prerouter는 다음 단계의 라우팅을 미리 예측해 읽기를 연산 뒤에 숨긴다. 같은 효과를 별도 학습 없이 근사했다. 레이어 L의 FFN 입력에 레이어 L+1의 router 가중치를 곱해, 다음 레이어가 고를 expert를 미리 점친다. 잔차 연결 때문에 이웃한 레이어의 hidden state가 비슷하다는 가정에 기댄 방법이다. 실제 decode의 hidden state를 기록해 정확도를 쟀다.
+
+| 항목 | 값 |
+| --- | ---: |
+| 다음 층 실제 top-8 중 예측 top-8에 든 비율 | 80.5% |
+| 같은 비율, 예측 top-12 / top-16 | 91.2% / 94.8% |
+| 두 층 뒤(L+2) 예측 top-8 | 74.1% |
+| 시뮬레이션(2 GiB LRU + 예측 top-8 미리 읽기): 기다려야 하는 읽기 | 182 → 64 MiB/토큰 |
+| 같은 시뮬레이션: 전체 읽기 / 미리 읽은 것 중 쓰인 비율 | 182 → 244 MiB/토큰 / 68% |
+
+시뮬레이션은 유망했다. 계산이 기다려야 하는 읽기가 65% 줄고, 대신 전체 읽기가 34% 는다. 실제로 구현했다. 레이어 L의 expert 호출이 시작되면 I/O 스레드 하나가 그 입력에 레이어 L+1의 router 가중치를 곱해 top-8을 고른다. 그중 캐시에 없는 expert는 낮은 우선순위 큐로 읽는다.
+
+| 프롬프트 4개, `-t 5` | decode (tok/s) | 읽기 대기 누적 | 미리 읽은 것 중 쓰인 비율 |
+| --- | ---: | ---: | ---: |
+| 예측 없음, I/O 4 | 4.76 | 102.5 s | — |
+| 예측 top-8, I/O 4 | 4.40 | 61.5 s | 76.9% |
+| 예측 top-8, I/O 6 | 4.52 | 33.0 s | 76.9% |
+
+대기 시간은 최대 3분의 1로 줄었고 미리 읽은 것의 77%가 실제로 쓰였지만, decode는 5\~8% 느려졌다. 예측 계산에 토큰당 약 11.6 ms가 들었고, 읽은 양은 204 GiB에서 264 GiB로 29% 늘었다. 계산, I/O, 예측이 같은 코어 6개를 나눠 쓰는 구조에서는 예측 계산과 늘어난 읽기 처리 비용이 대기 감소분보다 컸던 것으로 추정한다. CPU 시간을 항목별로 나눠 재지는 않았다. 예측 계산을 SIMD 내적으로 바꿔도 4.35에서 4.38 tok/s로 차이가 없었다. 그래서 채택하지 않았다.
+
+Edge0 모델 카드가 보고한 이득(decode 처리량 최대 59%)은 토큰당 expert 4개와 int4 가중치를 쓰는 모델에서 나온 값이고, 측정 하드웨어도 다르다. 이 보드에서는 I/O 하나당 CPU 비용을 줄이는 io_uring, 확신이 높은 예측만 미리 읽는 필터를 아직 시험하지 않았다.
+
+## 다른 모델에서도 통하나
+
+**GPU 하한은 expert를 CPU로 오프로드하는 MoE에서만 효과가 있었고, expert 캐시는 그중에서도 35B-A3B에서만 효과가 있었다.**
+
+같은 네 단계를 모델 다섯 종에 그대로 적용했다. 메모리에 들어가는 dense 3종(Gemma 4 E2B, E4B, Qwen3.5-9B), 메모리에 들어가는 MoE인 LFM2-8B-A1B(Q4_K_M 4.7 GiB), 메모리보다 큰 MoE인 gpt-oss-20b(21B, 활성 3.6B, MXFP4 11.3 GiB)다. gpt-oss-20b는 35B-A3B처럼 `--cpu-moe`로 expert를 CPU 쪽 mmap에 두었다. 프롬프트는 같은 12개를 chat 엔드포인트로 보냈고(thinking 끔), 생성 문장은 ① 기본과 비교했다. 메모리에 들어가는 모델은 앞의 하한 서비스가 반응하지 않으므로, 아무것도 오프로드하지 않는 `--n-cpu-moe 0`을 붙여 하한을 걸었다.
+
+<Figure caption="① 기본 대비 decode 배수. 프롬프트 12개 × 256토큰. 모든 모델과 단계에서 생성 문장이 ①과 같았다."><ModelControls /></Figure>
+
+**메모리에 들어가는 모델 4종은 어느 단계에서도 ±0.5% 안이었다.** GPU가 모든 연산을 맡으니 사용률이 높아, 하한이 없어도 governor가 decode 중 GPU를 1018\~1020 MHz로 돌리고 있었다. expert 캐시는 CPU 쪽에 expert 가중치가 없으면 초기화되지 않으므로 dense 모델과 LFM2 모두에서 켜지지 않았고, 계산 스레드 수도 결과를 바꾸지 않았다. MoE라는 사실만으로는 효과가 나지 않고, expert를 CPU로 오프로드해야 효과가 났다.
+
+**gpt-oss-20b에서는 GPU 하한이 35B-A3B보다 크게 통했지만, 캐시는 손해였다.** 기본 상태에서 decode 중 GPU 클럭은 평균 321 MHz였고, 하한을 걸자 2.86에서 3.97 tok/s(×1.39)가 됐다. 캐시를 더하면 2.72(`-t 6`)와 2.69(`-t 4`)로 하한만 건 경우는 물론 기본 상태보다도 느렸다.
+
+| gpt-oss-20b | decode (tok/s) | NVMe 읽기 (12요청) | prefill 평균 |
+| --- | ---: | ---: | ---: |
+| ② GPU 하한 (page cache) | 3.97 | 436 GiB | 13.8 s |
+| ④ + 캐시, `-t 4` | 2.69 | 1,923 GiB | 9.7 s |
+
+gpt-oss-20b는 레이어당 expert가 32개로 적은 대신 하나가 크다. 캐시 단위가 12.6 MiB라 2 GiB에는 전체 768개 중 162개(21%)만 들어간다. 캐시 미스율은 51%였고 NVMe 읽기는 4.4배로 늘었다. 35B-A3B는 전체의 11%만 담고도 미스율이 34%였다. 차이는 라우팅이 소수의 expert에 얼마나 몰리는지에서 온 것으로 추정하지만, gpt-oss-20b의 router 기록으로 확인하지는 않았다. page cache는 2 GiB로 제한되지 않고 남는 메모리 전체를 쓰므로, 이 모델에서는 그쪽이 더 많이 맞혔다. prefill은 캐시 쪽이 빨랐다. 병렬 O_DIRECT 읽기의 이점이 decode보다 prefill에서 크게 나타난 것으로 보인다.
+
+이 대조 실험에서 캐시 코드의 버그도 하나 드러났다. 캐시 슬롯은 "expert 조각 크기 + 4 KiB"만큼 잡았는데, 이는 조각 크기가 4 KiB의 배수라는 가정에 기댄 것이었다. 35B-A3B의 조각은 4 KiB 배수였지만 gpt-oss-20b의 조각은 4,406,400바이트다. 그래서 정렬된 O_DIRECT 읽기의 마지막 페이지가 다음 조각을 덮어써 출력이 `GGGG…`로 깨졌다. 슬롯 크기를 "조각 크기를 4 KiB로 올림한 값 + 4 KiB"로 고친 뒤 문장이 ①과 같아졌고, 위 gpt-oss-20b 캐시 수치는 고친 뒤의 값이다. 35B-A3B는 조각이 4 KiB 배수라 이 수정으로 바뀌는 것이 없다.
+
+## 무엇이 확인됐고, 남은 것
+
+**이 보드에서 35B-A3B의 decode는 5 tok/s 안팎까지 올라왔다. 다만 두 개선 모두 "expert를 CPU로 오프로드하는 MoE"라는 조건에 묶여 있고, 캐시는 그 안에서도 모델을 탄다.**
+
+이번 측정 범위 안에서의 판단은 다음과 같다.
+
+- **메모리보다 큰 MoE를 `--cpu-moe`로 돌린다면 GPU 클럭부터 확인한다.** decode 중 `/sys/class/devfreq/17000000.gpu/cur_freq`가 최저값에 머문다면, 최저 클럭만 올려도 이번 두 모델에서 1.24\~1.39배였다. 메모리에 들어가는 모델에는 필요 없다.
+- **expert 캐시는 적용 전에 확인한다.** expert가 작고 많은 35B-A3B에서는 하한 대비 1.47배였지만, expert가 크고 적은 gpt-oss-20b에서는 0.68배였다. router 기록으로 캐시 크기별 읽기량을 시뮬레이션하거나, page cache 경로와 같은 프롬프트로 비교해 보고 정한다.
+- **계산 스레드 수의 최적값은 읽기 경로에 따라 반대다.** page cache 경로에서는 `-t 12`, 캐시 경로에서는 `-t 4`였다.
+
+남은 질문은 두 가지다. ④에서도 계산 스레드는 읽기를 기다리는 시간이 있다. 이 대기를 줄이려면 I/O 하나당 CPU 비용을 줄이는 io_uring이 먼저다. 그래야 다음 층 예측처럼 읽기를 늘리는 방식이 6코어에서 이득을 낼 수 있다. 또 하나는 Edge0처럼 토큰당 expert 수를 줄이도록 다시 학습한 모델이다. 같은 보드와 같은 캐시에서 얼마나 달라지는지 확인할 필요가 있다.
+
+## 데이터와 범위
+
+**공개 자료는 본문 표와 도표의 원자료이며, 결론은 2026년 10월에 측정한 보드 한 대와 실험 패치를 얹은 llama.cpp 빌드 하나에 한정된다.**
+
+- [35B-A3B 단계별 요청 12개의 decode, prefill, NVMe 읽기, 문장 일치 여부](/data/jetson-orin-nano-moe-gpu-clock-expert-cache/qwen35-steps-per-request.csv)
+- [top-k 8/4 요청별 NVMe 읽기와 decode 시간](/data/jetson-orin-nano-moe-gpu-clock-expert-cache/decode-time-vs-nvme-topk.csv)
+- [GPU governor 클럭 분포와 전력](/data/jetson-orin-nano-moe-gpu-clock-expert-cache/gpu-governor.csv)
+- [캐시 크기별 시뮬레이션](/data/jetson-orin-nano-moe-gpu-clock-expert-cache/cache-size-simulation.csv)
+- [캐시 조정 스윕](/data/jetson-orin-nano-moe-gpu-clock-expert-cache/cache-tuning-sweeps.csv)
+- [다음 층 예측 정확도, 시뮬레이션, 실측](/data/jetson-orin-nano-moe-gpu-clock-expert-cache/prerouter.csv)
+- [모델 6종 대조 실험](/data/jetson-orin-nano-moe-gpu-clock-expert-cache/model-controls.csv)
+- [perplexity](/data/jetson-orin-nano-moe-gpu-clock-expert-cache/perplexity.csv)
+
+측정 환경은 1부와 같다(Jetson Orin Nano Super 8GB, MAXN_SUPER, JetPack 6.2.3, llama.cpp b1-19ff817). 35B-A3B 서버 옵션은 `--load-mode mmap --no-host --no-repack -c 4096 -b 512 -ub 512 -ngl 99 --no-op-offload --cpu-moe`이고, 캐시를 켠 실행은 zram 스왑을 쓰지 않도록 `MemorySwapMax=0`인 systemd scope 안에서 돌렸다. 매 실행 전에 모델 파일의 page cache를 비웠다.
+
+반복 횟수가 적다. 각 설정은 한 번씩 돌렸고, 단계 비교와 모델 대조는 프롬프트 12개, 조정 스윕과 예측 실험은 프롬프트 4개다. 품질은 생성 문장 일치와 wikitext-2 512토큰 8청크 perplexity로만 확인했다. perplexity는 겹치기 구현 단계에서 쟀고, ④ 설정은 생성 문장 일치로 확인했다. 캐시와 예측 패치는 원인 분리용 실험 구현이고, 같은 아이디어를 더 잘 구현하면 결과가 달라질 수 있다.
+
+### 참고
+
+1. [8GB Jetson Orin Nano에서 메모리보다 큰 MoE를 SSD로 스트리밍하기(1부)](/posts/jetson-orin-nano-sllm-moe-streaming/)
+2. [gnu-gnu/jetson-moe-gpu-stabilizer](https://github.com/gnu-gnu/jetson-moe-gpu-stabilizer)
+3. [Edge0/Edge0-35B-A3B-preview 모델 카드](https://huggingface.co/Edge0/Edge0-35B-A3B-preview)
+4. [ggml-org/gpt-oss-20b-GGUF](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF), [LiquidAI/LFM2-8B-A1B-GGUF](https://huggingface.co/LiquidAI/LFM2-8B-A1B-GGUF)

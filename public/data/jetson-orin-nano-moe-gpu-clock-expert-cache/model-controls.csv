@@ -1,0 +1,25 @@
+model,structure,case,requests,decode_tok_s_mean,decode_tok_s_min,decode_tok_s_max,prefill_ms_mean,busy_gpu_mhz_mean,gpu_min_freq_mhz,same_text_as_case1,nvme_read_gib_total
+gemma-4-E2B Q4_K_M,dense,1_default,12,28.661,28.277,28.767,157,1018,306,12,0.0
+gemma-4-E2B Q4_K_M,dense,2_gpu_floor,12,28.705,28.429,28.765,145,1020,1020,12,0.0
+gemma-4-E2B Q4_K_M,dense,3_cache_t6,12,28.653,28.383,28.733,146,1020,1020,12,0.0
+gemma-4-E2B Q4_K_M,dense,4_cache_t4,12,28.697,28.348,28.803,146,1020,1020,12,0.0
+gemma-4-E4B Q4_K_M,dense,1_default,12,15.079,15.006,15.12,260,1019,306,12,0.2
+gemma-4-E4B Q4_K_M,dense,2_gpu_floor,12,15.052,14.937,15.102,263,1020,1020,12,0.3
+gemma-4-E4B Q4_K_M,dense,3_cache_t6,12,15.126,15.007,15.17,255,1020,1020,12,0.0
+gemma-4-E4B Q4_K_M,dense,4_cache_t4,12,15.142,15.105,15.167,255,1020,1020,12,0.0
+Qwen3.5-9B IQ4_XS,dense,1_default,12,12.821,12.735,12.933,283,1020,306,12,0.2
+Qwen3.5-9B IQ4_XS,dense,2_gpu_floor,12,12.8,12.761,12.857,276,1020,1020,12,0.2
+Qwen3.5-9B IQ4_XS,dense,3_cache_t6,12,12.843,12.792,12.892,269,1020,1020,12,0.1
+Qwen3.5-9B IQ4_XS,dense,4_cache_t4,12,12.817,12.791,12.847,276,1020,1020,12,0.1
+LFM2-8B-A1B Q4_K_M,"MoE, fully resident",1_default,12,44.797,43.666,45.055,173,1018,306,12,0.1
+LFM2-8B-A1B Q4_K_M,"MoE, fully resident",2_gpu_floor,12,44.817,43.867,45.021,168,1020,1020,12,0.1
+LFM2-8B-A1B Q4_K_M,"MoE, fully resident",3_cache_t6,12,44.849,43.972,45.1,168,1020,1020,12,0.1
+LFM2-8B-A1B Q4_K_M,"MoE, fully resident",4_cache_t4,12,44.813,43.76,44.999,169,1020,1020,12,0.1
+gpt-oss-20b MXFP4,"MoE, experts on CPU",1_default,12,2.862,1.861,3.248,14130,321,306,12,444.3
+gpt-oss-20b MXFP4,"MoE, experts on CPU",2_gpu_floor,12,3.968,2.484,4.69,13801,1020,1020,12,435.7
+gpt-oss-20b MXFP4,"MoE, experts on CPU",3_cache_t6,12,2.716,2.386,3.383,8709,1020,1020,12,1922.1
+gpt-oss-20b MXFP4,"MoE, experts on CPU",4_cache_t4,12,2.69,2.372,3.341,9665,1020,1020,12,1922.1
+Qwen3.6-35B-A3B MXFP4,"MoE, experts on CPU",1_default,12,2.73,2.232,3.12,6735,,306,12,784.5
+Qwen3.6-35B-A3B MXFP4,"MoE, experts on CPU",2_gpu_floor,12,3.373,2.805,4.146,6692,,1020,12,780.6
+Qwen3.6-35B-A3B MXFP4,"MoE, experts on CPU",3_cache_t6,12,4.387,3.953,5.004,3406,,1020,12,583.0
+Qwen3.6-35B-A3B MXFP4,"MoE, experts on CPU",4_cache_t4,12,4.961,4.66,5.391,3490,,1020,12,583.0

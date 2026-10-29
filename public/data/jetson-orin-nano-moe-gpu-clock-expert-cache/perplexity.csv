@@ -1,0 +1,5 @@
+config,ppl,stderr
+"top-k 8, no cache",6.2344,0.34104
+top-k 6,6.5165,0.35985
+top-k 4,7.5774,0.43044
+"top-k 8, expert cache with overlap",6.2344,0.34104
