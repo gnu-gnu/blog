@@ -3,9 +3,9 @@ const ROWS = [
   { label: 'Gemma 4 E2B', sub: 'dense', f: 1.0015, c: 1.0013 },
   { label: 'Gemma 4 E4B', sub: 'dense', f: 0.9982, c: 1.0042 },
   { label: 'Qwen3.5-9B', sub: 'dense', f: 0.9984, c: 0.9997 },
-  { label: 'LFM2-8B-A1B', sub: 'MoE · 상주', f: 1.0004, c: 1.0004 },
-  { label: 'gpt-oss-20b', sub: 'MoE · 오프로드', f: 1.3864, c: 0.9399 },
-  { label: 'Qwen3.6-35B-A3B', sub: 'MoE · 오프로드', f: 1.2355, c: 1.8172 },
+  { label: 'LFM2-8B-A1B', sub: 'MoE · 메모리 상주', f: 1.0004, c: 1.0004 },
+  { label: 'gpt-oss-20b', sub: 'MoE · SSD 스트리밍', f: 1.3864, c: 0.9399 },
+  { label: 'Qwen3.6-35B-A3B', sub: 'MoE · SSD 스트리밍', f: 1.2355, c: 1.8172 },
 ];
 const X0 = 300;
 const W = 420;
