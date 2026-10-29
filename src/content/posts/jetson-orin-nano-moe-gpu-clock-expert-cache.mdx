@@ -84,12 +84,12 @@ Jetson의 GPU 클럭은 `nvhost_podgov` governor가 최근 구간의 GPU 사용�
 
 이 판단을 확인하려고 devfreq의 `min_freq`만 1020 MHz로 올렸습니다. decode는 2.73에서 3.37 tok/s로 1.24배가 됐고, 12요청 모두 빨라졌으며 생성 문장은 같았습니다.
 
-| 설정 | 측정 구간 클럭 분포 | GPU 사용률 평균 | 보드 입력 전력 평균 | decode (tok/s) |
-| --- | --- | ---: | ---: | ---: |
-| governor 기본값 | 306 MHz 99.5% | 26.8% | 7.7 W | 2.60 (2요청) |
-| 최저 클럭 1020 MHz | 1020 MHz 100% | 17.6% | 9.6 W | 3.37 (12요청) |
+| 설정 | 측정 구간 클럭 분포 | GPU 사용률 평균 | 추론 중 보드 전력 | decode (12요청) | 요청 간 변동계수 | 토큰당 에너지 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| governor 기본값 | 306 MHz 99.5% | 26.8% | 8.05 W | 2.73 tok/s | 10.0% | 2.95 J |
+| 최저 클럭 1020 MHz | 1020 MHz 100% | 17.6% | 9.63 W | 3.37 tok/s | 10.5% | 2.86 J |
 
-전력은 tegrastats의 `VDD_IN`을 측정 구간 전체로 평균한 값입니다. 평균 전력은 25% 늘었지만 decode가 그만큼 빨라져, 생성 토큰당 에너지는 거의 같았습니다. 기본값 쪽은 2요청이고 prefill 구간도 섞여 있어 대략적인 비교입니다.
+전력은 tegrastats의 `VDD_IN`을 추론 구간에서 평균한 값이고, 토큰당 에너지는 이 전력을 decode 속도로 나눈 값입니다. 하한을 걸면 전력은 20% 늘지만 decode도 그만큼 빨라져, 토큰당 에너지는 거의 같았습니다. 요청 간 편차도 그대로였습니다. 클럭 분포·사용률·전력은 별도 계측 실행에서 쟀고, 기본값 쪽은 그 실행이 2요청뿐이라 대략적인 비교입니다.
 
 ### 하한을 거는 방법 고르기
 
@@ -97,12 +97,33 @@ Jetson의 GPU 클럭은 `nvhost_podgov` governor가 최근 구간의 GPU 사용�
 
 | 방법 | 결과 또는 판단 |
 | --- | --- |
-| `jetson_clocks`(CPU·GPU·메모리 클럭을 모두 최대로 고정) | 두 차례 12요청 평균은 3.29, 3.63 tok/s로 비슷했지만 요청별 범위가 1.92\~4.71, 2.73\~5.11로 크게 흔들렸습니다. 클럭이 상시 고정되는 것도 요구사항에 맞지 않았습니다. |
+| `jetson_clocks`(CPU·GPU·메모리 클럭을 모두 최대로 고정) | 두 차례 12요청 평균은 3.29, 3.63 tok/s로 비슷했지만, 요청 간 변동계수가 25.8%와 20.7%로 하한만 건 경우(10.5%)의 두 배를 넘었습니다. 클럭이 상시 고정되는 것도 요구사항에 맞지 않았습니다. |
 | GPU에 더미 부하를 걸어 governor가 클럭을 올리게 하기 | 측정하지 않고 제외했습니다. Jetson GPU는 프로세스가 다르면 시분할로 번갈아 실행하므로 더미 커널이 추론 커널을 지연시킬 수 있고, 일을 하지 않는 연산에 전력을 씁니다. |
 | 추론 프로세스를 주기적으로 확인해 `min_freq` 조절 | 가능합니다. 다만 프로세스가 떠 있는지만 보면 서버가 놀고 있는 시간에도 하한이 걸리고, 사용률이나 page fault까지 보려면 확인 주기만큼 늦게 반응합니다. |
 | eBPF uprobe로 llama.cpp 호출을 감지해 `min_freq` 조절 | 채택했습니다. |
 
-채택한 방식은 bpftrace uprobe로 `libllama`의 `llama_decode`, `llama_process`, `llama_synchronize` 진입과 반환을 감시합니다. 명령줄에 `--cpu-moe`나 `--n-cpu-moe`가 있는 프로세스만 셉니다. 첫 호출에서 하한을 올리고, 마지막 반환 뒤 1초 동안 호출이 없으면 내립니다. 쓰는 값은 devfreq의 `min_freq` 하나뿐입니다. 서버가 요청을 처리하는 동안에만 하한이 걸리고 dense 모델에는 반응하지 않습니다. 대신 root 권한의 상주 서비스와 bpftrace 설치가 필요합니다. 이 도구는 [jetson-moe-gpu-stabilizer](https://github.com/gnu-gnu/jetson-moe-gpu-stabilizer)로 공개했습니다.
+### 공개한 도구: jetson-moe-gpu-stabilizer
+
+채택한 방식은 [jetson-moe-gpu-stabilizer](https://github.com/gnu-gnu/jetson-moe-gpu-stabilizer)로 정리해 MIT 라이선스로 공개했습니다. 이 글의 측정은 공개 전 버전으로 했고, 감지 방식과 1020 MHz 하한, 1초 유지 시간은 같습니다. 동작은 다음과 같습니다.
+
+1. bpftrace로 `libllama.so`의 `llama_decode`, `llama_process`, `llama_synchronize` 진입과 반환에 uprobe를 겁니다. 최근 llama-server와 llama-bench는 비동기 함수 `llama_process`를 부르고 작업이 `llama_synchronize`에서 끝날 수 있어서, 세 함수를 모두 추론 활동으로 봅니다.
+2. 명령줄에 `--cpu-moe`, `-cmoe`, `--n-cpu-moe`, `-ncmoe` 중 하나가 있는 프로세스만 셉니다. 요청 없이 떠 있는 서버나 dense 모델에는 반응하지 않습니다.
+3. 첫 호출에서 GPU devfreq의 `min_freq`를 올립니다. 기본값은 지원하는 최고 주파수(이 보드에서는 1020 MHz)입니다. 진행 중인 호출 없이 1초가 지나면, 그리고 서비스가 끝날 때 최저 주파수로 되돌립니다. `max_freq`, governor, CPU·메모리 클럭은 건드리지 않습니다.
+4. 5초마다 대상 라이브러리를 다시 확인합니다. uprobe는 이전 파일에 묶여 있으므로 llama.cpp를 다시 빌드하면 새 라이브러리에 다시 붙입니다.
+
+설치 전에 `--check`로 찾은 devfreq 노드와 라이브러리를 확인할 수 있습니다. 이 단계는 root가 필요하지 않습니다.
+
+```bash
+git clone https://github.com/gnu-gnu/jetson-moe-gpu-stabilizer
+cd jetson-moe-gpu-stabilizer
+python3 moe-gpu-stabilizer --check
+sudo ./install.sh
+journalctl -u moe-gpu-stabilizer -f
+```
+
+`--cpu-moe` 서버에 요청을 보내면 로그에 `floor 1020 MHz (pid … inference)`가 찍히고, 생성이 끝나고 약 1초 뒤 `floor 306 MHz (idle)`가 찍힙니다. 하한 값, 유지 시간, 추적할 라이브러리 경로, MoE 판정 플래그는 `/etc/default/moe-gpu-stabilizer`에서 바꿀 수 있습니다.
+
+이 방식의 절충점도 분명합니다. root 권한의 상주 서비스와 bpftrace가 필요하고, 외부에 공개된 함수 이름으로 찾기 때문에 llama.cpp만 감지합니다. MoE 오프로드 여부를 명령줄 플래그로 판단하므로, `--override-tensor`(`-ot`)처럼 다른 방식으로 expert를 오프로드한 프로세스는 그 플래그를 설정에 추가하지 않으면 감지하지 못합니다. 뒤의 대조 실험에서 gpt-oss-20b의 하한 없는 기준을 잴 때는 이 점을 이용했습니다. `jetson_clocks`처럼 `min_freq`를 쓰는 다른 도구와 함께 쓰면 서로 값을 덮어쓰므로 같이 쓰지 않습니다. 확인한 환경은 Orin Nano Super 8GB와 JetPack 6.2.3 하나뿐입니다.
 
 ## page cache 대신 expert 캐시를 직접 만들었습니다
 

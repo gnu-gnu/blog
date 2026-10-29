@@ -1,3 +1,5 @@
-config,requests,gpu_samples,share_at_306mhz,share_at_1020mhz,gpu_load_mean_pct,board_input_w_mean,decode_tok_s_mean
-default governor,2,7773,0.9952,0.0003,26.8,7.66,2.596
-GPU min_freq 1020 MHz,12,30697,0,1.0,17.6,9.57,3.373
+config,gpu_samples,share_at_306mhz,share_at_1020mhz,gpu_load_mean_pct,board_input_w_inference,decode_tok_s_12req,decode_cv_12req_pct,joule_per_token
+default governor,7773,0.9952,0.0003,26.8,8.05,2.73,10.0,2.95
+GPU min_freq 1020 MHz,30697,0,1.0,17.6,9.63,3.373,10.5,2.86
+jetson_clocks run 1,,,,,,3.286,25.8,
+jetson_clocks run 2,,,,,,3.625,20.7,
