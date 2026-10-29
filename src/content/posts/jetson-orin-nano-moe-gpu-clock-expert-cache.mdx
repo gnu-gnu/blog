@@ -9,6 +9,7 @@ draft: false
 ---
 
 import Figure from '../../components/Figure.astro';
+import GpuClockTimeline from '../../components/diagrams/GpuClockTimeline.jsx';
 import DecodeFixedCost from '../../components/diagrams/DecodeFixedCost.jsx';
 import ReadPathBeforeAfter from '../../components/diagrams/ReadPathBeforeAfter.jsx';
 import CacheSizeSim from '../../components/diagrams/CacheSizeSim.jsx';
@@ -41,7 +42,11 @@ import ModelControls from '../../components/diagrams/ModelControls.jsx';
 
 **llama-bench의 decode 측정은 MoE 라우팅을 대표하지 못했습니다.** llama-bench는 decode 입력 토큰을 `std::rand() % n_vocab`로 만듭니다. dense 모델에서는 문제가 되지 않지만, MoE는 토큰에 따라 고르는 expert가 달라집니다. 무작위 토큰열이 고르는 expert는 실제 문장과 다르고, expert 재사용과 page cache 적중률도 그만큼 달라집니다. 그래서 2부의 수치는 모두 실제 프롬프트로 다시 쟀습니다. 1부 TL;DR의 35B-A3B decode와 llama-bench로 잰 실험 결과는 2부 수치와 직접 비교하지 않습니다.
 
-**decode 중 GPU는 최저 클럭이었습니다.** 1부에서는 CPU와 GPU에 동시에 부하를 주는 시험에서 GPU가 1020 MHz를 유지하는 것만 확인했고, MoE decode 중의 클럭은 보지 않았습니다. 다시 재 보니 측정 구간 GPU 클럭 샘플 7,773개 중 7,736개(99.5%)가 최저인 306 MHz였습니다. 1부의 MoE 수치는 모두 이 상태에서 잰 값입니다.
+**decode 중 GPU는 최저 클럭이었습니다.** 1부에서는 CPU와 GPU에 동시에 부하를 주는 시험에서 GPU가 1020 MHz를 유지하는 것만 확인했고, MoE decode 중의 클럭은 보지 않았습니다. 다시 재 보니 추론 중 GPU 클럭 샘플 5,761개 중 5,726개(99.4%)가 최저인 306 MHz였습니다. 1부의 MoE 수치는 모두 이 상태에서 잰 값입니다.
+
+<Figure caption="Qwen3.6-35B-A3B decode 중 8초 구간을 약 31 ms 간격으로 샘플링했습니다. 사용률은 sysfs의 GPU load 값이고, 추론 중 평균은 사용률이 10%를 넘은 초만 평균했습니다. 두 구간 모두 클럭 샘플은 전부 같은 값이었습니다."><GpuClockTimeline /></Figure>
+
+GPU는 토큰마다 짧게 일하고 쉬기를 반복하며, 추론 중 평균 사용률은 36%였습니다. governor는 이 정도 사용률로는 클럭을 올리지 않았습니다. 최저 클럭을 1020 MHz로 올리면 같은 작업이 더 빨리 끝나 사용률이 20%로 내려갑니다. 이 관찰을 어떻게 해석했는지는 아래 GPU 클럭 절에서 다룹니다.
 
 **expert 연산은 up → gate → down이 아니라 gate → up → down 순서로 실행됩니다.** 1부에서는 본문과 도표에 up → gate → down 순서로 적었고, 비동기 로더도 이 전제로 만들었습니다. up 연산이 시작될 때 gate와 down을 미리 읽게 한 것입니다. llama.cpp는 그래프를 만들 때 up 노드를 먼저 만들지만, ggml은 실행 순서를 SwiGLU(gate, up)의 입력 순서로 정해 gate를 먼저 실행합니다. 뒤에서 다룰 캐시의 적중 통계가 예상과 다르게 나오면서 이 순서를 확인했습니다. 결국 1부의 비동기 로더가 미리 읽게 한 gate는 이미 계산이 끝난 뒤였고, 실제로 앞당겨진 것은 down뿐이었습니다. 1부에서 이 로더가 효과를 내지 못한 이유 중 하나일 수 있지만, 고친 로더로 다시 재지는 않았습니다.
 
@@ -78,18 +83,20 @@ top-k 4는 읽기를 줄여 decode가 3.89 tok/s까지 올랐습니다. 하지�
 
 **`--cpu-moe`에서는 GPU가 토큰마다 짧게 나눠 일해서 governor가 클럭을 최저로 두었습니다. 최저 클럭을 1020 MHz로 올린 것만으로 decode가 1.24배가 됐습니다.**
 
-고정 부분의 내용을 보려고 decode 중 GPU 사용률, GPU 클럭, CPU 클럭을 20 ms 간격으로 기록했습니다. GPU 사용률은 평균 26.8%였고, 클럭은 측정 시간의 99.5% 동안 306 MHz였습니다.
+고정 부분의 내용을 보려고 decode 중 GPU 사용률, GPU 클럭, CPU 클럭을 20 ms 간격으로 기록했습니다. 앞의 정정 절에서 본 것처럼 추론 중 GPU 사용률은 평균 36%였고, 클럭 샘플의 99.4%가 306 MHz였습니다.
 
 Jetson의 GPU 클럭은 `nvhost_podgov` governor가 최근 구간의 GPU 사용률을 보고 정합니다. `--cpu-moe`로 돌리면 토큰 하나를 만드는 동안 GPU(attention, shared expert, router)와 CPU(routed expert)가 40개 레이어에 걸쳐 번갈아 일합니다. GPU가 쉬는 동안 CPU가 일하므로 GPU 사용률은 낮게 보이고, governor는 클럭을 올릴 이유가 없다고 판단합니다. 그러나 GPU 구간은 토큰마다 반드시 지나는 경로에 있습니다. GPU 구간이 느려지면 CPU가 그만큼 기다리므로, 사용률이 낮아도 GPU 클럭은 토큰당 시간에 그대로 반영됩니다.
 
 이 판단을 확인하려고 devfreq의 `min_freq`만 1020 MHz로 올렸습니다. decode는 2.73에서 3.37 tok/s로 1.24배가 됐고, 12요청 모두 빨라졌으며 생성 문장은 같았습니다.
 
-| 설정 | 측정 구간 클럭 분포 | GPU 사용률 평균 | 추론 중 보드 전력 | decode (12요청) | 요청 간 변동계수 | 토큰당 에너지 |
+| 설정 | 추론 중 클럭 분포 | 추론 중 GPU 사용률 | 추론 중 보드 전력 | decode (12요청) | 요청 간 변동계수 | 토큰당 에너지 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| governor 기본값 | 306 MHz 99.5% | 26.8% | 8.05 W | 2.73 tok/s | 10.0% | 2.95 J |
-| 최저 클럭 1020 MHz | 1020 MHz 100% | 17.6% | 9.63 W | 3.37 tok/s | 10.5% | 2.86 J |
+| governor 기본값 | 306 MHz 99.4% | 36.0% | 8.05 W | 2.73 tok/s | 10.0% | 2.95 J |
+| 최저 클럭 1020 MHz | 1020 MHz 100% | 19.8% | 9.63 W | 3.37 tok/s | 10.5% | 2.86 J |
 
-전력은 tegrastats의 `VDD_IN`을 추론 구간에서 평균한 값이고, 토큰당 에너지는 이 전력을 decode 속도로 나눈 값입니다. 하한을 걸면 전력은 20% 늘지만 decode도 그만큼 빨라져, 토큰당 에너지는 거의 같았습니다. 요청 간 편차도 그대로였습니다. 클럭 분포·사용률·전력은 별도 계측 실행에서 쟀고, 기본값 쪽은 그 실행이 2요청뿐이라 대략적인 비교입니다.
+전력은 tegrastats의 `VDD_IN`을 추론 구간에서 평균한 값이고, 토큰당 에너지는 이 전력을 decode 속도로 나눈 값입니다. 하한을 걸면 전력은 20% 늘지만 decode도 그만큼 빨라져, 토큰당 에너지는 거의 같았습니다.
+
+사용률과 토큰 시간을 곱하면 토큰당 GPU가 일한 시간을 어림할 수 있습니다. 같은 계측 실행에서 기본값은 토큰당 385 ms 중 약 139 ms(36%), 하한을 건 경우는 296 ms 중 약 59 ms(19.8%)였습니다. GPU 시간이 약 80 ms 줄었고 토큰 시간은 89 ms 줄어, decode 단축분의 대부분이 GPU 구간에서 나왔다고 봅니다. sysfs 사용률은 드라이버가 평균한 값이고 prefill 구간도 섞여 있어 어림값입니다. 요청 간 편차도 그대로였습니다. 클럭 분포·사용률·전력은 별도 계측 실행에서 쟀고, 기본값 쪽은 그 실행이 2요청뿐이라 대략적인 비교입니다.
 
 ### 하한을 거는 방법 고르기
 
