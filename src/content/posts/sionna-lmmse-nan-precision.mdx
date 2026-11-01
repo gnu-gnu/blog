@@ -256,6 +256,8 @@ Sionna 코드는 고치지 않았습니다. `h_var`에 `tf.math.real`을 거는 
 
 즉 감쇠가 큰 것만으로는 걸리지 않고, 정규화하지 않은 단말별 표본으로 공분산을 만들어 작은 전력이 공분산까지 들어갔을 때만 걸립니다. 입력이나 공분산을 정규화해 쓰는 일반적인 경우에는 닿을 일이 드물 것으로 봅니다. 분모를 대각 값에 대한 상대값으로 비교하면 두 경우를 함께 막을 수 있어 보이지만, 이 수정은 식으로만 계산했고 Sionna에서 돌려 보지는 않았습니다.
 
+여담으로, 1e-12라는 숫자가 눈에 익어서 찾아봤습니다. [Reddit의 질문](https://www.reddit.com/r/AskEngineers/comments/ncah6b/why_bit_error_rate_ber_1e12_is_so_popular)을 보고 흥미가 생겼는데, 통신에서는 비트 오류율(BER) 목표로 자주 보이는 값입니다. [IEEE 802.3 Ethernet 작업 문서](https://www.ieee802.org/3/100GNGOPTX/public/sept11/motions_01_0911_NG100GOPTX.pdf)에 "BER 1e-12 이하" 목표가 나오고, 오류 없이 약 3e12비트를 보내면 95% 신뢰로 이 값을 보였다고 할 수 있어 10 Gbps로 약 5분이면 시험할 수 있습니다. 다만 왜 하필 이 값이 골라졌는지 설명하는 출처는 찾지 못했고, [SONET 쪽은 1e-10을 쓴다는 자료](https://www.lightwaveonline.com/home/article/16647704/explaining-those-ber-testing-mysteries)도 있습니다. FEC를 쓰는 최근 Ethernet에서는 [프레임 손실률로 바꾸자는 논의](https://grouper.ieee.org/groups/802/3/400GSG/public/adhoc/logic/jun26_13/anslow_01_0613_logic.pdf)도 있었습니다. Sionna의 1e-12는 이와 무관한 분모 허용 오차이니, 숫자만 같은 셈입니다.
+
 ## 마치며
 
 - **결과 비교 검증이 원본의 문제까지 드러냈습니다.** 속도만 쟀다면 만나지 못했을 NaN이고, 두 구현만 비교했다면 어느 쪽 문제인지 가르지 못했을 것입니다.
