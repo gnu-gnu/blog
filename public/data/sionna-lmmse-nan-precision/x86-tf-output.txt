@@ -1,0 +1,6 @@
+tf 2.17.0 NVIDIA RTX PRO 6000 Blackwell Workstation Edition build 12.8
+complex64 matmul         /GPU:0  n=3334 0아닌 대각 288/288 max 3.693e-11 min(0 제외) 8.420e-14 complex64 저장 후 max 3.693e-11 0아닌 288, 최대 |s| 2.375e+13, NaN 원소 0
+complex64 입력 캐스트 c128    /GPU:0  n=3334 0아닌 대각 288/288 max 3.569e-20 min(0 제외) 7.138e-23 complex64 저장 후 max 3.569e-20 0아닌 288, 최대 |s| 2.802e+22, NaN 원소 288
+complex128 입력            /GPU:0  n=3334 0아닌 대각 288/288 max 1.323e-19 min(0 제외) 6.089e-23 complex64 저장 후 max 1.323e-19 0아닌 288, 최대 |s| 3.280e+22, NaN 원소 285
+complex64 matmul         /CPU:0  n=200 0아닌 대각 0/288 max 0.000e+00 min(0 제외) 0.000e+00 complex64 저장 후 max 0.000e+00 0아닌 0, 최대 |s| 0.000e+00, NaN 원소 0
+complex64 입력 캐스트 c128    /CPU:0  n=200 0아닌 대각 0/288 max 0.000e+00 min(0 제외) 0.000e+00 complex64 저장 후 max 0.000e+00 0아닌 0, 최대 |s| 0.000e+00, NaN 원소 0

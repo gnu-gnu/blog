@@ -1,0 +1,43 @@
+--- 1. JS 맛보기: 0이어야 할 값, === 0 가드, Infinity*0
+0.1+0.2-0.3 = 5.551115123125783e-17 / === 0 ? false
+fround(1e20)*fround(1e20) in float32 = Infinity / *0 = NaN
+fround(1e-21) = 9.999999682655225e-22 / fround(1+1e-21) = 1
+
+--- 2. 저장 공분산의 실제 대각값을 식에 넣음 (float32)
+complex64-accum 최소 잔여 (complex64 누적)        im=-4.979e-15  |s|=6.456e+14   s(s-1).re=-4.168e+29  err=-1.607e+0
+complex128-accum 최소 잔여 (complex128 누적)       im=-1.251e-25  |s|=2.565e+25   s(s-1).re=-Infinity   err=NaN
+Sionna 관측값 |s| max = 2.5654985e25 (nan-repro summary)
+
+--- 3. 비단조성: 잔여물 크기를 바꿈 (float32, R=complex128-accum)
+                                   im=1.000e-5    |s|=3.209e+5    s(s-1).re=-1.030e+11  err=-1.604e+0
+                                   im=1.000e-8    |s|=3.209e+8    s(s-1).re=-1.030e+17  err=-1.604e+0
+                                   im=1.000e-10   |s|=3.209e+10   s(s-1).re=-1.030e+21  err=-1.604e+0
+                                   im=1.000e-15   |s|=3.209e+15   s(s-1).re=-1.030e+31  err=-1.604e+0
+                                   im=1.000e-18   |s|=3.209e+18   s(s-1).re=-1.030e+37  err=-1.604e+0
+                                   im=1.000e-19   |s|=3.209e+19   s(s-1).re=-Infinity   err=NaN
+                                   im=1.000e-20   |s|=3.209e+20   s(s-1).re=-Infinity   err=NaN
+                                   im=1.000e-21   |s|=3.209e+21   s(s-1).re=-Infinity   err=NaN
+                                   im=1.000e-25   |s|=3.209e+25   s(s-1).re=-Infinity   err=NaN
+허수부 정확히 0                          im=0.000e+0    |s|=0.000e+0    s(s-1).re=0.000e+0    err=1.604e+0
+NaN 경계 |ε| ≈ 1.739e-19 (= 1.084e-19 × R)
+
+--- 4. 같은 입력을 double로 (JS 기본 number)
+complex128-accum 최소 잔여, float64              im=-1.251e-25  |s|=2.565e+25   s(s-1).re=-6.582e+50  err=-1.604e+0
+ε=1e-160, float64                  im=1.000e-160  |s|=3.209e+160  s(s-1).re=-Infinity   err=NaN
+
+--- 5. 전파: NaN*마스크0, 같은 인덱스 누적
+err * mask(0) = NaN
+a[0][0] + (NaN 2880개) = NaN
+
+--- 6. 3×3 시스템 풀이: JS 소거법 vs Sionna 관측
+정상 A[0][0]    : 0.4209 -0.1596 0.4209
+A[0][0]=NaN (JS): NaN NaN NaN
+Sionna 관측     : ext_mat 유한, 0번 부반송파 h_hat 전부 0, err_var 유한 → 출력 검사 통과
+
+--- 7. 잔여물 생성: h·conj(h) 대각 허수부
+float64, 같은 순서 합산   : |ε| max=0.000e+0 min(0 제외)=- 0개수=288/288
+float32, 같은 순서 합산   : |ε| max=0.000e+0 min(0 제외)=- 0개수=288/288
+float64, 다른 순서 합산   : |ε| max=4.034e-19 min(0 제외)=1.012e-22 0개수=0/288
+float32, 다른 순서 합산   : |ε| max=1.935e-10 min(0 제외)=2.128e-13 0개수=0/288
+실측 complex128-accum (complex128): max=1.707e-21 min=1.251e-25
+실측 complex64-accum (complex64) : max=6.325e-11 min=4.979e-15
