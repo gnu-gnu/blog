@@ -12,9 +12,11 @@ export default function KernelResidualOrder() {
   return (
     <svg viewBox="0 0 760 640" width="100%" role="img" aria-label="곱셈 순서별 대각 허수부 잔여물">
       <text x="16" y="34" fontSize="24" fontWeight="700" fill="var(--cds-text-primary)">대각 허수부 = Σ (aᵢ·aᵣ − aᵣ·aᵢ)</text>
-      <text x="16" y="66" fontSize="20" fill="var(--cds-text-secondary)">수식으로는 항마다 0입니다. 남는지는 곱셈 순서에 달렸습니다.</text>
+      <text x="16" y="66" fontSize="20" fill="var(--cds-text-secondary)">수식으로는 항마다 0인데, 구현에 따라 남기도 하고 0이기도 합니다.</text>
+      <text x="16" y="116" fontSize="20" fontWeight="600" fill="var(--cds-text-primary)">계산 순서 (재현 모델)</text>
+      <text x="625" y="88" fontSize="20" textAnchor="middle" fill="var(--cds-text-secondary)">실측 잔여물</text>
       {cols.map((x, i) => (
-        <text key={head[i]} x={x} y="112" fontSize="20" textAnchor="middle" fontWeight="600" fill="var(--cds-text-primary)">{head[i]}</text>
+        <text key={head[i]} x={x} y="116" fontSize="20" textAnchor="middle" fontWeight="600" fill="var(--cds-text-primary)">{head[i]}</text>
       ))}
       {rows.map((r, n) => {
         const y = 126 + n * 106;
